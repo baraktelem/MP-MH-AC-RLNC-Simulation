@@ -60,8 +60,9 @@ class MPNetwork:
         
         self.receiver = SimReceiver(self.paths, self.rtt, unit_name="SimReceiver")
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
-        self.sender = SimSender(self.num_packets_to_send, self.rtt, self.paths, max_allowed_overlap, threshold, 
-                               receiver=self.receiver, initial_epsilon=init_eps)
+        self.sender = SimSender(self.num_packets_to_send, self.rtt, self.paths,
+                               initial_epsilon=init_eps, max_allowed_overlap=max_allowed_overlap,
+                               threshold=threshold, receiver=self.receiver)
 
         # Statistics
         self.sender_information_packets_sending_times : dict[int, int] = {} # Mapping for each information packet to the time it was sent
