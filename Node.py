@@ -18,8 +18,8 @@ class Node:
         self.receiver = NodeReceiver(hop_num, input_paths, rtt, unit_name, self)
         self.sender = NodeSender()
 
-        # Buffers
-        self.new_information_packets_buffer : set[int] = set() # New RLNCs
-        self.correction_information_packets_buffer : set[int] = set() # both FEC and FB-FEC
+    def run_step(self, time: int=None):
+        self.receiver.run_step(time)
+        self.sender.run_step(time)
         
         

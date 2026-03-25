@@ -255,18 +255,36 @@ class NodeReceiver(GeneralReceiver):
         self.new_information_packets_buffer : set[int] = set() # New RLNCs
         self.correction_information_packets_buffer : set[int] = set() # both FEC and FB-FEC
 
+        # Global Channel Mapping
+        self.curr_packet_type_in_glob_paths : dict[int, RLNCType] = {}
+
         # Statistics
         self.new_rlnc_packets_history : list[RLNCPacket] = []
         self.correction_packets_history : list[RLNCPacket] = []
 
+    def run_step(self, time: int=None):
+        self.curr_packet_type_in_glob_paths = {}
+        super().run_step(time)
+    
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
+        """This function is called for each RLNC that arrives on a path. It does the following:
+        1. Add packet to buffer
+        2. Add packet to history
+        3. Map packet type to global paths"""
         information_packets = set(arrived_packet.get_information_packets())
         if arrived_packet.get_type() == RLNCType.NEW:
-            self.new_rlnc_packets_history.append(arrived_packet)
             self.new_information_packets_buffer.update(information_packets)
-        else: # Correction packet - both FEC and FB-FEC
-            self.correction_packets_history.append(arrived_packet)
+            self.new_rlnc_packets_history.append(arrived_packet)
+        else: # Correction packet - FEC, FB-FEC or CORRECTION
             self.correction_information_packets_buffer.update(information_packets)
+            self.correction_packets_history.append(arrived_packet)
+        
+        # Assert each global path is mapped only once at each time step
+        global_path_id = arrived_packet.get_global_path()
+        assert self.curr_packet_type_in_glob_paths.get(global_path_id, None) is None, \
+            f"[{self.t}] {self.unit_name}: Packet type already mapped to global path {global_path_id}"
+        # Map packet type to global paths
+        self.curr_packet_type_in_glob_paths[global_path_id] = arrived_packet.get_type()
 
     def __repr__(self) -> str:
         s = super().__repr__()

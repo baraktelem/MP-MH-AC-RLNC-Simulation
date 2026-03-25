@@ -5,9 +5,9 @@ from dataclasses import dataclass
 class RLNCType(Enum):
     """Type of RLNC packet: NEW (information), A-PRIORI-FEC, or FB-FEC"""
     NEW = 0  # NEW information packet
-    FEC = 1  # A-priori FEC packet
-    FB_FEC = 2  # Feedback-based FEC packet
-    CORRECTION = 3  # Correction packet - both FEC and FB-FEC
+    FEC = 1  # A-priori FEC packet, created by the sender
+    FB_FEC = 2  # Feedback-based FEC packet, created by the sender
+    CORRECTION = 3  # Correction packet created by intermediate nodes
 
 class FeedbackType(Enum):
     """Type of feedback: ACK (innovative) or NACK (non-innovative)"""
