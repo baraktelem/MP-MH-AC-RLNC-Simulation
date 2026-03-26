@@ -62,8 +62,8 @@ class Path:
     def add_packet_to_forward_channel(self, packet: Packet, current_time: int):
         self.forward_channel.add_packets_to_pending_packets_buffer([packet], current_time=current_time)
 
-    def get_pending_packets_buffer(self):
-        return self.pending_packets_buffer
+    # def get_pending_packets_buffer(self):
+    #     return self.pending_packets_buffer
     
     def get_dropped_packets(self):
         return self.forward_channel.get_dropped_packets()
@@ -158,8 +158,8 @@ class Channel:
     def get_propagation_delay(self):
         return self.propagation_delay
 
-    def get_pending_packets_buffer(self):
-        return self.pending_packets_buffer
+    # def get_pending_packets_buffer(self):
+    #     return self.pending_packets_buffer
 
     def __repr__(self, include_packets_in_channel=True, include_arrived_packets=True):
         s = f"{self.channel_name}"

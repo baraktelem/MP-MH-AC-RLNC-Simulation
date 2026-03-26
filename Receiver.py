@@ -230,6 +230,7 @@ class SimReceiver(GeneralReceiver):
         if hasattr(self, 't') and self.t > 0:
             total_information_decoded = len(self.information_packets_decoding_times)
             s += f"\n  normalized throughput for t{self.t}: {total_information_decoded / self.t}"
+        return s
 
 
 class NodeReceiver(GeneralReceiver):
@@ -241,11 +242,13 @@ class NodeReceiver(GeneralReceiver):
         unit_name: str=None,
         parent_node: 'Node'=None,
     ):
-        # Set unit name before calling super() for setting name that is not "GeneralReceiver"
-        if unit_name is None:
+        # Constants
+        if unit_name is None:   # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeReceiver[{hop_num}]"
         super().__init__(input_paths, rtt, unit_name)
         self.hop_num = hop_num
+
+        # Network
         self.parent_node = parent_node
 
         # Buffers
@@ -255,22 +258,24 @@ class NodeReceiver(GeneralReceiver):
         self.new_information_packets_buffer : set[int] = set() # New RLNCs
         self.correction_information_packets_buffer : set[int] = set() # both FEC and FB-FEC
 
-        # Global Channel Mapping
-        self.curr_packet_type_in_glob_paths : dict[int, RLNCType] = {}
+        # Natural Matching Tracking
+        self.global_paths_rlnc_types : dict[int, RLNCType] = {}
 
         # Statistics
         self.new_rlnc_packets_history : list[RLNCPacket] = []
         self.correction_packets_history : list[RLNCPacket] = []
 
     def run_step(self, time: int=None):
-        self.curr_packet_type_in_glob_paths = {}
+        self.global_paths_rlnc_types = {}
         super().run_step(time)
+        self.parent_node.global_paths_rlnc_types = self.global_paths_rlnc_types
     
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         """This function is called for each RLNC that arrives on a path. It does the following:
         1. Add packet to buffer
         2. Add packet to history
         3. Map packet type to global paths"""
+        # TODO: Maybe on first packet arrival we should update both buffers
         information_packets = set(arrived_packet.get_information_packets())
         if arrived_packet.get_type() == RLNCType.NEW:
             self.new_information_packets_buffer.update(information_packets)
@@ -281,10 +286,11 @@ class NodeReceiver(GeneralReceiver):
         
         # Assert each global path is mapped only once at each time step
         global_path_id = arrived_packet.get_global_path()
-        assert self.curr_packet_type_in_glob_paths.get(global_path_id, None) is None, \
+        assert self.global_paths_rlnc_types.get(global_path_id, None) is None, \
             f"[{self.t}] {self.unit_name}: Packet type already mapped to global path {global_path_id}"
+        
         # Map packet type to global paths
-        self.curr_packet_type_in_glob_paths[global_path_id] = arrived_packet.get_type()
+        self.global_paths_rlnc_types[global_path_id] = arrived_packet.get_type()
 
     def __repr__(self) -> str:
         s = super().__repr__()

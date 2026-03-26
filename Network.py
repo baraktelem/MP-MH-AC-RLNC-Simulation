@@ -3,6 +3,7 @@ from Channels import Channel, ForwardChannel, Path
 from CodedEquation import CodedEquation
 from Sender import SimSender
 from Receiver import GeneralReceiver, SimReceiver
+from Node import Node
 
 from contextlib import redirect_stdout
 import os
@@ -23,7 +24,7 @@ class SimulationStats:
     num_information_packets_decoded : int = 0 # Total number of information packets decoded by receiver
     num_transmissions_dropped : int = 0 # Number of transmissions that were dropped
 
-class MPNetwork:
+class Network:
     def __init__(
         self,
         path_epsilons: list[float],
@@ -35,6 +36,7 @@ class MPNetwork:
         threshold: float = 0.0,
         max_allowed_overlap: int = None,
     ):
+        # Constants & Parameters
         self.t = 0
         self.path_epsilons = path_epsilons
         self.num_paths = num_paths
@@ -54,16 +56,6 @@ class MPNetwork:
         else:
             self.num_packets_to_send = sys.maxsize
 
-        self.paths = [Path(prop_delay, epsilon, 0, i) for i, epsilon in enumerate(path_epsilons)]
-        for i, path in enumerate(self.paths):
-            path.set_global_path_index(i)
-        
-        self.receiver = SimReceiver(self.paths, self.rtt, unit_name="SimReceiver")
-        init_eps = initial_epsilon if initial_epsilon is not None else 0.0
-        self.sender = SimSender(self.num_packets_to_send, self.rtt, self.paths,
-                               initial_epsilon=init_eps, max_allowed_overlap=max_allowed_overlap,
-                               threshold=threshold, receiver=self.receiver)
-
         # Statistics
         self.sender_information_packets_sending_times : dict[int, int] = {} # Mapping for each information packet to the time it was sent
         self.sender_num_total_transmissions : int = 0 # Number of transmissions at the end of simulation
@@ -78,6 +70,7 @@ class MPNetwork:
         self.simulation_stats : SimulationStats = None # Simulation stats at the end of simulation
         self.sender_num_transmissions_dropped : int = 0 # Number of transmissions that were dropped
 
+        
     def run_sim(self):
         if self.max_iterations is not None:
             for t in range(1, self.max_iterations + 1):
@@ -94,7 +87,7 @@ class MPNetwork:
                     self.t += 1
                     self.sender.run_step()
             self.collect_stats()
-            print(f"Simulation completed at t={self.max_iterations} - all packets decoded")
+            print(f"Simulation completed at t={self.t} - all packets decoded")
 
     def collect_stats(self):
         self.collect_sender_stats()
@@ -167,3 +160,70 @@ class MPNetwork:
     def get_simulation_stats(self) -> SimulationStats:
         """Get simulation statistics after run_sim() completes."""
         return self.simulation_stats
+
+class MPNetwork(Network):
+    def __init__(
+        self,
+        path_epsilons: list[float],
+        initial_epsilon: float = None,
+        max_iterations: int = None,
+        num_packets_to_send: int = None,
+        num_paths: int = 4,
+        prop_delay: int = 2,
+        threshold: float = 0.0,
+        max_allowed_overlap: int = None,
+    ):
+        super().__init__(path_epsilons, initial_epsilon, max_iterations, num_packets_to_send, num_paths, prop_delay, threshold, max_allowed_overlap)
+        # Paths
+        self.paths = [Path(prop_delay, epsilon, 0, i) for i, epsilon in enumerate(path_epsilons)]
+        for i, path in enumerate(self.paths):
+            path.set_global_path_index(i)
+        
+        # Units
+        self.receiver = SimReceiver(self.paths, self.rtt, unit_name="SimReceiver")
+        init_eps = initial_epsilon if initial_epsilon is not None else 0.0
+        self.sender = SimSender(self.num_packets_to_send, self.rtt, self.paths,
+                               initial_epsilon=init_eps, max_allowed_overlap=max_allowed_overlap,
+                               threshold=threshold, receiver=self.receiver)
+
+
+class MpMhNetwork(Network):
+    def __init__(
+        self,
+        path_epsilons: list[list[float]],
+        initial_epsilon: float = None,
+        max_iterations: int = None,
+        num_packets_to_send: int = None,
+        num_paths: int = 4,
+        prop_delay: int = 6,
+        threshold: float = 0.0,
+        max_allowed_overlap: int = None,
+        num_hops: int = 3,
+        ):
+        super().__init__(path_epsilons, initial_epsilon, max_iterations, num_packets_to_send, num_paths, prop_delay, threshold, max_allowed_overlap)
+        # Constants & Parameters
+        self.num_hops = num_hops
+        
+        # Natural matching tracking
+        self.global_paths_idx_by_r : list[int] = list(range(1, num_paths + 1))
+        
+        # Paths & Nodes
+        self.paths = [[] for _ in range(num_hops)]
+        self.nodes = []
+        for hop_idx in range(num_hops):
+            for path_idx in range(num_paths):
+                path = Path(prop_delay, path_epsilons[hop_idx][path_idx], hop_idx, path_idx)
+                path.set_global_path_index(path_idx + 1)
+                self.paths[hop_idx].append(path)
+            if hop_idx > 0:
+                node = Node(hop_idx - 1, self.paths[hop_idx - 1], self.paths[hop_idx], self.rtt, unit_name=f"Node[{hop_idx - 1}]", Network=self)
+                self.nodes.append(node)
+
+        # Sender on first hop, receiver on last hop
+        init_eps = initial_epsilon if initial_epsilon is not None else 0.0
+        self.sender = SimSender(self.num_packets_to_send, self.rtt, self.paths[0],
+                               initial_epsilon=init_eps, max_allowed_overlap=max_allowed_overlap,
+                               threshold=threshold, network=self)
+        self.receiver = SimReceiver(self.paths[-1], self.rtt, unit_name="SimReceiver")
+        
+            
