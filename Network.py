@@ -3,8 +3,6 @@ from Sender import SimSender
 from Receiver import SimReceiver
 from Node import Node
 
-from contextlib import redirect_stdout
-import os
 import sys
 from dataclasses import dataclass
 
@@ -74,11 +72,7 @@ class Network:
     def run_sim(self):
         if self.max_iterations is not None:
             for t in range(1, self.max_iterations + 1):
-                if self.debug:
-                    self.sender.run_step()
-                else:
-                    with redirect_stdout(open(os.devnull, 'w')):
-                        self.sender.run_step()
+                self.sender.run_step()
                 if len(self.receiver.information_packets_decoding_times) >= self.num_packets_to_send:
                     break
             self.t = t
@@ -87,11 +81,7 @@ class Network:
         else:
             while len(self.receiver.information_packets_decoding_times) < self.num_packets_to_send:
                 self.t += 1
-                if self.debug:
-                    self.sender.run_step()
-                else:
-                    with redirect_stdout(open(os.devnull, 'w')):
-                        self.sender.run_step()
+                self.sender.run_step()
             self.collect_stats()
             print(f"Simulation completed at t={self.t} - all packets decoded")
 
@@ -191,7 +181,7 @@ class MPNetwork(Network):
             debug
             )
         # Paths
-        self.paths = [Path(prop_delay, epsilon, 0, i) for i, epsilon in enumerate(path_epsilons)]
+        self.paths = [Path(prop_delay, epsilon, 0, i, debug=self.debug) for i, epsilon in enumerate(path_epsilons)]
         for i, path in enumerate(self.paths):
             path.set_global_path_index(i)
         
@@ -200,6 +190,7 @@ class MPNetwork(Network):
             self.paths, 
             self.rtt, 
             unit_name="SimReceiver",
+            debug=self.debug,
             )
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
         self.sender = SimSender(
@@ -210,6 +201,7 @@ class MPNetwork(Network):
             max_allowed_overlap=max_allowed_overlap,
             threshold=threshold,
             next_hop=self.receiver,
+            debug=self.debug,
             )
 
 
@@ -248,7 +240,7 @@ class MpMhNetwork(Network):
         self.paths : list[list[Path]] = [[] for _ in range(num_hops)]
         for hop_idx in range(num_hops):
             for path_idx in range(num_paths):
-                path = Path(prop_delay, path_epsilons[hop_idx][path_idx], hop_idx, path_idx)
+                path = Path(prop_delay, path_epsilons[hop_idx][path_idx], hop_idx, path_idx, debug=self.debug)
                 path.set_global_path_index(path_idx + 1)
                 self.paths[hop_idx].append(path)
         
@@ -262,6 +254,7 @@ class MpMhNetwork(Network):
                 rtt=self.rtt,
                 unit_name=f"Node[{hop_idx}]",
                 Network=self,
+                debug=self.debug,
             )
             # Connect previous node to current node
             if hop_idx > 1:
@@ -274,6 +267,7 @@ class MpMhNetwork(Network):
             input_paths=self.paths[-1],
             rtt=self.rtt,
             unit_name="SimReceiver",
+            debug=self.debug,
             )
         # Connect last node to receiver
         if num_hops > 1:
@@ -290,6 +284,7 @@ class MpMhNetwork(Network):
             threshold=threshold,
             network=self,
             next_hop=self.nodes[0] if num_hops > 1 else self.receiver,
+            debug=self.debug,
         )
         
     def update_natural_matching(self, global_paths_idx_by_r: list[int]):

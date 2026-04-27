@@ -12,12 +12,13 @@ class Path:
     feedback_channel: 'Channel' # The channel object that is responsible for sending ACK/NACKs back to the sender
     propagation_delay: int
 
-    def __init__(self, propagation_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int, name_prefix: str=""):
+    def __init__(self, propagation_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False):
         self.hop_index = hop_index
         self.path_index_in_hop = path_index_in_hop
+        self.debug = debug
         self.unit_name = f"{name_prefix}Path[{hop_index}][{path_index_in_hop}]"
-        self.forward_channel = ForwardChannel(propagation_delay, epsilon, hop_index, path_index_in_hop, name_prefix=self.unit_name+".")
-        self.feedback_channel = Channel(propagation_delay, hop_index, path_index_in_hop, name_prefix=self.unit_name+".Feedback")
+        self.forward_channel = ForwardChannel(propagation_delay, epsilon, hop_index, path_index_in_hop, name_prefix=self.unit_name+".", debug=debug)
+        self.feedback_channel = Channel(propagation_delay, hop_index, path_index_in_hop, name_prefix=self.unit_name+".Feedback", debug=debug)
         self.my_sender = None
         self.my_receiver = None
         assert self.feedback_channel.get_propagation_delay() == self.forward_channel.get_propagation_delay(), \
@@ -73,6 +74,8 @@ class Path:
         return rlnc_packet
 
     def sim_print(self, message: str, time: int=None):
+        if not self.debug:
+            return
         if time is not None:
             print(f"[{time}] {self.unit_name}: {message}")
         else:
@@ -90,8 +93,9 @@ class Channel:
     global_path_index: int
     channel_name: str
     
-    def __init__(self, propagation_delay: int, hop_index: int, path_index_in_hop: int, name_prefix: str=""):
+    def __init__(self, propagation_delay: int, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False):
         self.propagation_delay = propagation_delay
+        self.debug = debug
         self.packets_in_channel = []
         self.arrived_packets = []
         self.hop_index = hop_index
@@ -119,8 +123,9 @@ class Channel:
             assert packet.prop_time_left_in_channel == 0, \
                 f"{self.channel_name}: Arrived packet has prop_time_left_in_channel={packet.prop_time_left_in_channel}, expected 0:\n    {packet}"
             self.arrived_packets.append(packet)
-        print(f"[{self.channel_name}]: All arrived packets:\n\t{packets_arrived}")
-        print(f"[{self.channel_name}]: All packets still in channel:\n\t{self.packets_in_channel}")
+        if self.debug:
+            print(f"[{self.channel_name}]: All arrived packets:\n\t{packets_arrived}")
+            print(f"[{self.channel_name}]: All packets still in channel:\n\t{self.packets_in_channel}")
     
     def add_packet_to_history(self, packet):
         self.channel_history.append(deepcopy(packet))
@@ -170,7 +175,8 @@ class Channel:
         return s
 
     def sim_print(self, message: str, time: int):
-        return #! DEBUG
+        if not self.debug:
+            return
         print(f"[{time}] {self.channel_name}: {message}")
 
 class ForwardChannel(Channel):

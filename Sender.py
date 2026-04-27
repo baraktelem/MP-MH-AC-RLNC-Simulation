@@ -124,8 +124,10 @@ class GeneralSender:
         paths: list[Path],
         init_paths: bool = False, # Default is False for SimSender
         initial_epsilon: float = 0.0,
+        debug: bool = False,
         ):
         self.t = 0
+        self.debug = debug
 
         # Constants
         self.rtt = rtt
@@ -189,6 +191,8 @@ class GeneralSender:
                 self.inforamtion_packets_first_transmission_times[packet] = self.t
 
     def sim_print(self, message: str):
+        if not self.debug:
+            return
         print(f"[{self.t}] {self.unit_name}: {message}")
 
 class SimSender(GeneralSender):
@@ -202,8 +206,9 @@ class SimSender(GeneralSender):
         threshold: float = 0.0,
         network = None,
         next_hop : 'SimReceiver | Node' = None,
+        debug: bool = False,
         ):
-        super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon)
+        super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
         # Sender constants
         self.unit_name = "SimSender"
         self.num_of_packets_to_send = num_of_packets_to_send
@@ -669,12 +674,13 @@ class NodeSender(GeneralSender):
         initial_epsilon: float = 0.0,
         unit_name: str=None,
         parent_node: 'Node'=None,
+        debug: bool = False,
         ):
         # Constants
         if unit_name is None: # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeSender[{hop_num}]"
         self.unit_name = unit_name
-        super().__init__(rtt, paths, init_paths=True, initial_epsilon=initial_epsilon)
+        super().__init__(rtt, paths, init_paths=True, initial_epsilon=initial_epsilon, debug=debug)
         self.hop_num = hop_num
 
         # Network

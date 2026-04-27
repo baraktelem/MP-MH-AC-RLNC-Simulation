@@ -60,8 +60,10 @@ class GeneralReceiver:
     def __init__(self,
                 input_paths: list[Path],
                 rtt: int,
-                unit_name: str=None):
+                unit_name: str=None,
+                debug: bool = False):
         self.unit_name = unit_name if unit_name is not None else "GeneralReceiver"
+        self.debug = debug
 
         # Receiver paths
         self.receiver_paths = [ReceiverPath(path, i, self) for i, path in enumerate(input_paths)]
@@ -160,6 +162,8 @@ class GeneralReceiver:
         return self.sent_feedback_channel_history
 
     def sim_print(self, message: str) -> None:
+        if not self.debug:
+            return
         print(f"[{self.t}] {self.unit_name}: {message}")
 
     def __repr__(self) -> str:
@@ -177,11 +181,12 @@ class SimReceiver(GeneralReceiver):
     def __init__(self,
                 input_paths: list[Path],
                 rtt: int,
-                unit_name: str=None):
+                unit_name: str=None,
+                debug: bool = False):
         # Set unit name before calling super() for setting name that is not "GeneralReceiver"
         if unit_name is None:
             unit_name = "SimReceiver"
-        super().__init__(input_paths, rtt, unit_name)
+        super().__init__(input_paths, rtt, unit_name, debug=debug)
 
         # Decoding
         self.coded_equations : list[CodedEquation] = [] # All undecoded equations
@@ -241,11 +246,12 @@ class NodeReceiver(GeneralReceiver):
         rtt: int,
         unit_name: str=None,
         parent_node: 'Node'=None,
+        debug: bool = False,
     ):
         # Constants
         if unit_name is None:   # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeReceiver[{hop_num}]"
-        super().__init__(input_paths, rtt, unit_name)
+        super().__init__(input_paths, rtt, unit_name, debug=debug)
         self.hop_num = hop_num
 
         # Network
