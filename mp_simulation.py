@@ -330,7 +330,8 @@ if __name__ == "__main__":
                         max_allowed_overlap=O_BAR,
                         num_paths=NUM_PATHS,
                         prop_delay=PROP_DELAY,
-                        threshold=THRESHOLD
+                        threshold=THRESHOLD,
+                        debug=False,
                     )
                     network.run_sim()
                     

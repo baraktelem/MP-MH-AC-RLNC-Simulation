@@ -1,7 +1,7 @@
-from Packet import Packet, RLNCPacket, FeedbackPacket, RLNCType, FeedbackType, PacketID
-from Channels import Channel, ForwardChannel, Path
+from Packet import Packet, RLNCPacket, FeedbackPacket, RLNCType, NodeRLNCType, FeedbackType, PacketID
+from Channels import Path
 from CodedEquation import CodedEquation
-from typing import Optional
+# from typing import Optional
 import copy
 
 class ReceiverPath(Path):
@@ -259,7 +259,7 @@ class NodeReceiver(GeneralReceiver):
         self.correction_information_packets_buffer : set[int] = set() # both FEC and FB-FEC
 
         # Natural Matching Tracking
-        self.global_paths_rlnc_types : dict[int, RLNCType] = {}
+        self.global_paths_rlnc_types : dict[int, NodeRLNCType | RLNCType] = {} # Mapping for each global path index to the RLNC type
 
         # Statistics
         self.new_rlnc_packets_history : list[RLNCPacket] = []
@@ -268,7 +268,10 @@ class NodeReceiver(GeneralReceiver):
     def run_step(self, time: int=None):
         self.global_paths_rlnc_types = {}
         super().run_step(time)
-        self.parent_node.global_paths_rlnc_types = self.global_paths_rlnc_types
+        # Mark all dropped packets in mapping
+        for path_idx in range(1,self.num_of_input_paths+1):
+            if self.global_paths_rlnc_types.get(path_idx, None) is None:
+                self.global_paths_rlnc_types[path_idx] = NodeRLNCType.DROPPED
     
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         """This function is called for each RLNC that arrives on a path. It does the following:
@@ -291,6 +294,9 @@ class NodeReceiver(GeneralReceiver):
         
         # Map packet type to global paths
         self.global_paths_rlnc_types[global_path_id] = arrived_packet.get_type()
+
+    def get_global_paths_rlnc_types(self) -> dict[int, NodeRLNCType | RLNCType]:
+        return self.global_paths_rlnc_types
 
     def __repr__(self) -> str:
         s = super().__repr__()

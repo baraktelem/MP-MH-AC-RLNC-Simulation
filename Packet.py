@@ -1,18 +1,25 @@
-from enum import Enum
+from enum import Enum, auto
 from typing import Optional
 from dataclasses import dataclass
 
-class RLNCType(Enum):
-    """Type of RLNC packet: NEW (information), A-PRIORI-FEC, or FB-FEC"""
-    NEW = 0  # NEW information packet
-    FEC = 1  # A-priori FEC packet, created by the sender
-    FB_FEC = 2  # Feedback-based FEC packet, created by the sender
-    CORRECTION = 3  # Correction packet created by intermediate nodes
+class PacketType(Enum):
+    """Empty base class to allow subclassing"""
+    pass
 
-class FeedbackType(Enum):
+class RLNCType(PacketType):
+    """Type of RLNC packet: NEW (information), A-PRIORI-FEC, or FB-FEC"""
+    NEW = auto()  # NEW information packet
+    FEC = auto()  # A-priori FEC packet, created by the sender
+    FB_FEC = auto()  # Feedback-based FEC packet, created by the sender
+
+class NodeRLNCType(PacketType):
+    CORRECTION = auto()  # Correction packet created by intermediate nodes
+    DROPPED = auto()  # NodeReceiver marked as dropped
+
+class FeedbackType(PacketType):
     """Type of feedback: ACK (innovative) or NACK (non-innovative)"""
-    ACK = 0  # Packet increased rank (innovative)
-    NACK = 1  # Packet did not increase rank (non-innovative)
+    ACK = auto()  # Packet increased rank (innovative)
+    NACK = auto()  # Packet did not increase rank (non-innovative)
 
 @dataclass(frozen=True)
 class PacketID:

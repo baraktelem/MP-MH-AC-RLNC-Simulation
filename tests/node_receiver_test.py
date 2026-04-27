@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Channels import Path
-from Packet import RLNCPacket, RLNCType
+from Packet import RLNCPacket, RLNCType, NodeRLNCType
 from Receiver import NodeReceiver
 from Sender import SimSender
 
@@ -113,7 +113,7 @@ def test_NR3_fb_fec_and_correction_go_to_correction_buffer():
     nr = create_node_receiver(num_paths=2)
 
     fb_fec_pkt = make_rlnc_packet([10, 11], global_path_id=0, rlnc_type=RLNCType.FB_FEC)
-    correction_pkt = make_rlnc_packet([12, 13], global_path_id=1, rlnc_type=RLNCType.CORRECTION)
+    correction_pkt = make_rlnc_packet([12, 13], global_path_id=1, rlnc_type=NodeRLNCType.CORRECTION)
 
     inject_to_arrived(nr, 0, fb_fec_pkt)
     inject_to_arrived(nr, 1, correction_pkt)
@@ -192,7 +192,7 @@ def test_NR7_all_correction_types_stored_in_correction_history():
 
     fec = make_rlnc_packet([1], global_path_id=0, rlnc_type=RLNCType.FEC, creation_time=0)
     fb_fec = make_rlnc_packet([2], global_path_id=1, rlnc_type=RLNCType.FB_FEC, creation_time=0)
-    correction = make_rlnc_packet([3], global_path_id=2, rlnc_type=RLNCType.CORRECTION, creation_time=0)
+    correction = make_rlnc_packet([3], global_path_id=2, rlnc_type=NodeRLNCType.CORRECTION, creation_time=0)
 
     inject_to_arrived(nr, 0, fec)
     inject_to_arrived(nr, 1, fb_fec)
@@ -253,14 +253,14 @@ def test_NR10_global_path_mapping_multiple_types_on_multiple_paths():
 
     new_pkt = make_rlnc_packet([1], global_path_id=0, rlnc_type=RLNCType.NEW, creation_time=0)
     fec_pkt = make_rlnc_packet([2], global_path_id=1, rlnc_type=RLNCType.FEC, creation_time=0)
-    corr_pkt = make_rlnc_packet([3], global_path_id=2, rlnc_type=RLNCType.CORRECTION, creation_time=0)
+    corr_pkt = make_rlnc_packet([3], global_path_id=2, rlnc_type=NodeRLNCType.CORRECTION, creation_time=0)
 
     inject_to_arrived(nr, 0, new_pkt)
     inject_to_arrived(nr, 1, fec_pkt)
     inject_to_arrived(nr, 2, corr_pkt)
     nr.run_step(time=1)
 
-    expected = {0: RLNCType.NEW, 1: RLNCType.FEC, 2: RLNCType.CORRECTION}
+    expected = {0: RLNCType.NEW, 1: RLNCType.FEC, 2: NodeRLNCType.CORRECTION}
     assert nr.curr_packet_type_in_glob_paths == expected, \
         f"Expected {expected}, got {nr.curr_packet_type_in_glob_paths}"
     print("  PASSED")
@@ -370,7 +370,7 @@ def test_NR14_sim_sender_to_node_receiver_100_steps():
         rtt=RTT,
         paths=paths,
         initial_epsilon=0.0,
-        receiver=node_receiver,
+        next_hop=node_receiver,
     )
 
     with redirect_stdout(open(os.devnull, "w")):

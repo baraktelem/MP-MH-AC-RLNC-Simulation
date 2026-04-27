@@ -68,7 +68,7 @@ class Path:
     def get_dropped_packets(self):
         return self.forward_channel.get_dropped_packets()
 
-    def run_forward_channel_step(self, current_time: int) -> RLNCPacket:
+    def run_forward_channel_step(self, current_time: int) -> RLNCPacket | None:
         rlnc_packet = self.forward_channel.run_step(current_time=current_time)
         return rlnc_packet
 
@@ -170,6 +170,7 @@ class Channel:
         return s
 
     def sim_print(self, message: str, time: int):
+        return #! DEBUG
         print(f"[{time}] {self.channel_name}: {message}")
 
 class ForwardChannel(Channel):
@@ -210,7 +211,9 @@ class ForwardChannel(Channel):
     #     return packet, dropped
 
 
-    def run_step(self, current_time: int) -> RLNCPacket:
+    def run_step(self, current_time: int) -> RLNCPacket | None:
+        """Run step for forward channel
+        Returns: The packet that was sent on this step, or None if the packet was dropped by the forward channel"""
         # Propagate packets in channel
         super().run_step()
         # Add packet from pending_packets_buffer to channel so it'll start propagating from next step

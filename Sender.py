@@ -1,4 +1,4 @@
-from Packet import RLNCPacket, FeedbackPacket, RLNCType, FeedbackType, PacketID
+from Packet import RLNCPacket, FeedbackPacket, RLNCType, NodeRLNCType, FeedbackType, PacketID
 from Channels import Channel, ForwardChannel, Path
 from CodedEquation import CodedEquation
 from copy import deepcopy
@@ -102,11 +102,12 @@ class SimSenderPath(GeneralSenderPath):
     def get_mp(self):
         return self.mp
 
-    def run_forward_channel_step(self, current_time: int) -> RLNCPacket:
-        rlnc_packet = super().run_forward_channel_step(current_time)
-        if rlnc_packet is not None:
-            self.my_sender.new_transmission_updates(rlnc_packet)
-        return rlnc_packet  
+    # def run_forward_channel_step(self, current_time: int) -> RLNCPacket:
+    #     """Run forward channel step and updates new transmitions statistics"""
+    #     rlnc_packet = super().run_forward_channel_step(current_time)
+    #     if rlnc_packet is not None:
+    #         self.my_sender.new_transmission_updates(rlnc_packet)
+    #     return rlnc_packet  
 
     def get_params(self) -> dict[str, any]:
         params = super().get_params()
@@ -146,6 +147,7 @@ class GeneralSender:
         
         # Statistics
         self.all_feedback_history : list[FeedbackPacket] = []
+        self.inforamtion_packets_first_transmission_times : dict[int, int] = {} # Time of first transmission of each information packet
 
     def run_step(self, time: int=None):
         """Update time, get feedbacks from all paths and update r for each path"""
@@ -170,12 +172,24 @@ class GeneralSender:
         self.all_feedback_history.extend(deepcopy(self.feedbacks))
 
     def send_packet(self, path: GeneralSenderPath, packet: RLNCPacket):
+        # self.update_information_packets_first_transmission_times(packet)
         path.add_packet_to_forward_channel(packet, current_time=self.t)
-        path.run_forward_channel_step(current_time=self.t)
+        rlnc_packet = path.run_forward_channel_step(current_time=self.t)
+        if rlnc_packet is not None:
+            self.new_transmission_updates(rlnc_packet)
+        self.latest_rlnc_packet_on_air = packet
 
     def new_transmission_updates(self, rlnc_packet_to_send: RLNCPacket):
-        self.latest_rlnc_packet_on_air = rlnc_packet_to_send
+        self.update_information_packets_first_transmission_times(rlnc_packet_to_send)
+        # self.latest_rlnc_packet_on_air = rlnc_packet_to_send
 
+    def update_information_packets_first_transmission_times(self, new_rlnc_packet: RLNCPacket):
+        for packet in new_rlnc_packet.get_information_packets():
+            if packet not in self.inforamtion_packets_first_transmission_times:
+                self.inforamtion_packets_first_transmission_times[packet] = self.t
+
+    def sim_print(self, message: str):
+        print(f"[{self.t}] {self.unit_name}: {message}")
 
 class SimSender(GeneralSender):
     def __init__(
@@ -187,7 +201,7 @@ class SimSender(GeneralSender):
         max_allowed_overlap: int = None,
         threshold: float = 0.0,
         network = None,
-        receiver = None,
+        next_hop : 'SimReceiver | Node' = None,
         ):
         super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon)
         # Sender constants
@@ -196,7 +210,7 @@ class SimSender(GeneralSender):
         self.paths = [SimSenderPath(path, self, i, initial_epsilon) for i, path in enumerate(paths)]
         self.num_of_paths = len(self.paths)
         self.my_network = network
-        self.my_receiver = receiver
+        self.next_hop = next_hop
 
         # Receiver state tracking
         self.acked_equations: dict[PacketID, CodedEquation] = {} # Acked equations
@@ -233,7 +247,6 @@ class SimSender(GeneralSender):
         self.num_rlnc_until_ew = 0
         
         # Statistics
-        self.inforamtion_packets_first_transmission_times : dict[int, int] = {} # Time of first transmission of each information packet
         self.parameters_history = {
             "md1": [self.md1],
             "md2": [self.md2],
@@ -249,7 +262,9 @@ class SimSender(GeneralSender):
     
     def run_step(self, time: int=None):
         super().run_step(time)
-        self.update_natural_matching()
+        # On MP MH networks - Send global paths ranking to the network
+        if hasattr(self.my_network, 'update_natural_matching'):
+            self.update_natural_matching()
         # Figure out which packets arrived to receiver
         self.infer_receiver_state() 
         # Update parameters from received feedbacks
@@ -274,7 +289,7 @@ class SimSender(GeneralSender):
         
     def update_natural_matching(self):
         paths_by_r = sorted(self.paths, key=lambda path: path.r, reverse=True)
-        self.my_network.global_paths_idx_by_r = [path.get_global_path_index() for path in paths_by_r]
+        self.my_network.update_natural_matching([path.get_global_path_index() for path in paths_by_r])
 
     def is_max_overlap(self):
         # Check if max overlap has been reached un current time and raise flag
@@ -605,15 +620,15 @@ class SimSender(GeneralSender):
         super().new_transmission_updates(rlnc_packet_to_send)
         if rlnc_packet_to_send.get_type() == RLNCType.NEW:
             self.num_rlnc_until_ew += 1
-        self.update_information_packets_first_transmission_times(rlnc_packet_to_send)
+        # self.update_information_packets_first_transmission_times(rlnc_packet_to_send)
         self.add_equation_to_waiting_feedback(rlnc_packet_to_send)
         self.add_rlnc_packet_to_history(rlnc_packet_to_send)
         self.update_latest_information_packet_on_air(rlnc_packet_to_send)
     
-    def update_information_packets_first_transmission_times(self, new_rlnc_packet: RLNCPacket):
-        for packet in new_rlnc_packet.get_information_packets():
-            if packet not in self.inforamtion_packets_first_transmission_times:
-                self.inforamtion_packets_first_transmission_times[packet] = self.t
+    # def update_information_packets_first_transmission_times(self, new_rlnc_packet: RLNCPacket):
+    #     for packet in new_rlnc_packet.get_information_packets():
+    #         if packet not in self.inforamtion_packets_first_transmission_times:
+    #             self.inforamtion_packets_first_transmission_times[packet] = self.t
     
     def update_latest_information_packet_on_air(self, new_rlnc_packet: RLNCPacket):
         latest_information_packet_in_new_rlnc_packet = max(new_rlnc_packet.get_information_packets())
@@ -623,13 +638,13 @@ class SimSender(GeneralSender):
         # Run step for all remaining paths and receiver
         for path in self.remaining_paths_for_transmission: # When the simulation ends, there will be no remaining paths for transmission
             path.run_forward_channel_step(current_time=self.t)
-        self.my_receiver.run_step()
+        self.next_hop.run_step()
 
     def get_all_rlnc_history(self) -> list[RLNCPacket]:
         return self.sent_new_rlnc_history + self.sent_fec_history + self.sent_fb_fec_history
 
-    def sim_print(self, message: str):
-        print(f"[{self.t}] {self.unit_name}: {message}")
+    # def sim_print(self, message: str):
+    #     pass
 
     def __repr__(self):
         s = "SimSender:"
@@ -671,18 +686,22 @@ class NodeSender(GeneralSender):
 
         # Statistics
         self.new_rlnc_packets_history : list[RLNCPacket] = []
+        self.new_information_packets_history : set[int] = set()
         self.correction_packets_history : list[RLNCPacket] = []
+        self.correction_information_packets_history : set[int] = set()
 
     def run_step(self, time: int=None):
         super().run_step(time)  # Update time, get feedbacks, and update r for each path
         self.infer_receiver_state() # Not implemented for 1st step
-        self.update_buffers()
+        self.update_buffers_and_history()
         self.perform_natural_matching()
         self.create_and_send_rlnc_on_all_paths()
 
     def create_and_send_rlnc_on_all_paths(self):
         global_path_pkt_rlnc_types = self.get_global_paths_rlnc_types()
-        
+        if not global_path_pkt_rlnc_types: # Packets were not received yet
+            return
+
         for path in self.paths:
             global_path_idx = path.get_global_path_index()
             global_path_rlnc_type = global_path_pkt_rlnc_types.get(global_path_idx, None)
@@ -694,6 +713,8 @@ class NodeSender(GeneralSender):
             if rlnc_packet_to_send is not None:
                 self.send_packet(path, rlnc_packet_to_send)
                 self.add_rlnc_packet_to_history(rlnc_packet_to_send)
+            else:
+                path.run_forward_channel_step(current_time=self.t)
         
     def add_rlnc_packet_to_history(self, rlnc_packet: RLNCPacket):
         if rlnc_packet.get_type() == RLNCType.NEW:
@@ -701,14 +722,14 @@ class NodeSender(GeneralSender):
         else:
             self.correction_packets_history.append(rlnc_packet)
     
-    def create_rlnc(self, path: GeneralSenderPath, rlnc_type: RLNCType):
+    def create_rlnc(self, path: GeneralSenderPath, rlnc_type: RLNCType) -> RLNCPacket | None:
         information_packets: list[int] = []
         rlnc_type_to_send: RLNCType = None
         if rlnc_type == RLNCType.NEW:
             information_packets = list(self.new_information_packets_buffer)
             rlnc_type_to_send = RLNCType.NEW
         else:
-            rlnc_type_to_send = RLNCType.CORRECTION
+            rlnc_type_to_send = NodeRLNCType.CORRECTION
             information_packets = list(self.correction_information_packets_buffer)
         # Create RLNC only if packets had arrived
         if len(information_packets) > 0:
@@ -722,14 +743,22 @@ class NodeSender(GeneralSender):
             return rlnc_packet_to_send
         return None
 
-    def update_buffers(self):
+    def update_buffers_and_history(self):
         """
         In step 1: Duplicate buffers from the NodeReceiver
         In step 2: Remove decoded information packets from buffers
         """
+        new_information_packets = self.get_receiver_new_information_packets()
+        correction_information_packets = self.get_receiver_correction_information_packets()
+        
+        # Update history
+        self.new_information_packets_history.update(new_information_packets)
+        self.correction_information_packets_history.update(correction_information_packets)
+
+        # Update buffers
         # TODO: maybe if one buffer is empty, we should put the 2nd buffer's packets into the 1st buffer (at the start of the sim)
-        self.new_information_packets_buffer = self.get_receiver_new_information_packets()
-        self.correction_information_packets_buffer = self.get_receiver_correction_information_packets()
+        self.new_information_packets_buffer = new_information_packets
+        self.correction_information_packets_buffer = correction_information_packets
 
     def get_receiver_new_information_packets(self) -> set[int]:
         return self.parent_node.get_receiver_new_information_packets()

@@ -57,7 +57,7 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
     ax1 = fig.add_subplot(131, projection='3d')
     
     # Plot capacity surface first (as reference)
-    ax1.plot_surface(EPS1, EPS2, capacity_grid.T, color='red', 
+    ax1.plot_surface(EPS2, EPS1, capacity_grid.T, color='red', 
                     edgecolor='none', alpha=0.2, label='Capacity')
     
     # Plot each protocol's throughput
@@ -75,7 +75,7 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
         
         # Plot surface with protocol-specific colormap
         cmap = colormaps[idx % len(colormaps)]
-        surf = ax1.plot_surface(EPS1, EPS2, throughput_mean_grid.T, cmap=cmap, 
+        surf = ax1.plot_surface(EPS2, EPS1, throughput_mean_grid.T, cmap=cmap, 
                                 edgecolor='none', alpha=0.6)
         
         # Add error bars
@@ -84,16 +84,17 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
             for j, eps2 in enumerate(unique_eps2):
                 mean_val = throughput_mean_grid[i, j]
                 std_val = throughput_std_grid[i, j]
-                ax1.plot([eps1, eps1], [eps2, eps2], 
+                ax1.plot([eps2, eps2], [eps1, eps1], 
                         [mean_val - std_val, mean_val + std_val],
                         color=color, linewidth=1.0, alpha=0.7)
     
-    ax1.set_xlabel('Epsilon 1 (Path 0)', fontsize=10)
-    ax1.set_ylabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax1.set_xlabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax1.set_ylabel('Epsilon 1 (Path 0)', fontsize=10)
     ax1.set_zlabel('Normalized Throughput', fontsize=10)
     ax1.set_zlim(0, 3)  # Set z-axis limits for throughput
     ax1.set_title('Normalized Throughput Comparison', fontsize=12, fontweight='bold')
     ax1.view_init(elev=20, azim=45)
+    ax1.invert_yaxis()
     
     # ========================================
     # Plot 2: Mean In-Order Delay Comparison
@@ -114,7 +115,7 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
         
         # Plot surface
         cmap = colormaps[idx % len(colormaps)]
-        surf = ax2.plot_surface(EPS1, EPS2, delay_mean_grid.T, cmap=cmap,
+        surf = ax2.plot_surface(EPS2, EPS1, delay_mean_grid.T, cmap=cmap,
                                 edgecolor='none', alpha=0.6)
         
         # Add error bars
@@ -123,16 +124,17 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
             for j, eps2 in enumerate(unique_eps2):
                 mean_val = delay_mean_grid[i, j]
                 std_val = delay_mean_std_grid[i, j]
-                ax2.plot([eps1, eps1], [eps2, eps2], 
+                ax2.plot([eps2, eps2], [eps1, eps1], 
                         [mean_val - std_val, mean_val + std_val],
                         color=color, linewidth=1.0, alpha=0.7)
     
-    ax2.set_xlabel('Epsilon 1 (Path 0)', fontsize=10)
-    ax2.set_ylabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax2.set_xlabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax2.set_ylabel('Epsilon 1 (Path 0)', fontsize=10)
     ax2.set_zlabel('Mean In-Order Delay', fontsize=10)
     ax2.set_zlim(0, 600)  # Set z-axis limits for mean delay
     ax2.set_title('Mean In-Order Delay Comparison', fontsize=12, fontweight='bold')
     ax2.view_init(elev=20, azim=45)
+    ax2.invert_yaxis()
     
     # ========================================
     # Plot 3: Max In-Order Delay Comparison
@@ -153,7 +155,7 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
         
         # Plot surface
         cmap = colormaps[idx % len(colormaps)]
-        surf = ax3.plot_surface(EPS1, EPS2, delay_max_grid.T, cmap=cmap,
+        surf = ax3.plot_surface(EPS2, EPS1, delay_max_grid.T, cmap=cmap,
                                 edgecolor='none', alpha=0.6)
         
         # Add error bars
@@ -162,25 +164,26 @@ def plot_stats_comparison(datasets: list[tuple[str, list]]):
             for j, eps2 in enumerate(unique_eps2):
                 mean_val = delay_max_grid[i, j]
                 std_val = delay_max_std_grid[i, j]
-                ax3.plot([eps1, eps1], [eps2, eps2], 
+                ax3.plot([eps2, eps2], [eps1, eps1], 
                         [mean_val - std_val, mean_val + std_val],
                         color=color, linewidth=1.0, alpha=0.7)
     
-    ax3.set_xlabel('Epsilon 1 (Path 0)', fontsize=10)
-    ax3.set_ylabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax3.set_xlabel('Epsilon 2 (Path 1)', fontsize=10)
+    ax3.set_ylabel('Epsilon 1 (Path 0)', fontsize=10)
     ax3.set_zlabel('Max In-Order Delay', fontsize=10)
     ax3.set_zlim(0, 600)  # Set z-axis limits for max delay
     ax3.set_title('Max In-Order Delay Comparison', fontsize=12, fontweight='bold')
     ax3.view_init(elev=20, azim=45)
+    ax3.invert_yaxis()
     
     # Add legend with protocol labels
     legend_text = '\n'.join([f'{colors[i % len(colors)]}: {label}' 
                             for i, (label, _) in enumerate(datasets)])
     
-    # Add overall title with protocol names
-    protocols_str = ' vs '.join([label for label, _ in datasets])
-    fig.suptitle(f'Protocol Comparison: {protocols_str}\n(Path 2: eps=0.2, Path 3: eps=0.8)',
-                 fontsize=14, fontweight='bold', y=1.02)
+    ## Add overall title with protocol names
+    # protocols_str = ' vs '.join([label for label, _ in datasets])
+    # fig.suptitle(f'Protocol Comparison: {protocols_str}\n(Path 2: eps=0.2, Path 3: eps=0.8)',
+    #              fontsize=14, fontweight='bold', y=1.02)
     
     plt.tight_layout()
     
