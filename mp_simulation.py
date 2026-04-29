@@ -36,7 +36,7 @@ def save_results(results: list[tuple[float, float, SimulationStats]], filename: 
     """
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"simulation_results_{timestamp}.pkl"
+        filename = f"mp_simulation_results_{timestamp}.pkl"
     
     with open(filename, 'wb') as f:
         pickle.dump(results, f)
@@ -275,7 +275,7 @@ if __name__ == "__main__":
     
     # Option to load existing results or run new simulations
     LOAD_EXISTING = False  # Set to True to load existing results, False to run new simulations
-    RESULTS_FILE = "simulation_results.pkl"  # File to save/load results
+    RESULTS_FILE = "mp_simulation_results.pkl"  # File to save/load results
 
     print(f"\nSimulation parameters:")
     print(f"  - Propagation delay: {PROP_DELAY} (RTT={PROP_DELAY*2})")

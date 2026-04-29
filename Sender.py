@@ -89,7 +89,7 @@ class SimSenderPath(GeneralSenderPath):
                 my_sender: 'SimSender',
                 path_index: int,
                 initial_epsilon: float = 0.0):
-        super().__init__(path, my_sender, path_index)
+        super().__init__(path, my_sender, path_index, initial_epsilon=initial_epsilon)
         self.mp : int = 0
         self.unit_name = f"{self.my_sender.unit_name}.SenderPath[{path_index}]"
 
@@ -567,10 +567,14 @@ class SimSender(GeneralSender):
     def update_delta(self):
         self.mdg = self.md1 + self.md2
         self.adg = self.ad1 + self.ad2
-        try:
+        if self.adg > 0:
             self.d = self.mdg / self.adg
-        except ZeroDivisionError:
-            self.d = self.d
+        elif self.mdg > 0:
+            # adg = 0 with mdg > 0: limit of mdg/adg in eq. (4) → +inf.
+            self.d = float("inf")
+        else:
+            # mdg = adg = 0 (no transmissions in flight yet): nothing to balance.
+            self.d = 0.0
         self.delta = self.num_of_paths * ( self.d - 1 - self.threshold)
         self.parameters_history["delta"].append(self.delta)
         self.parameters_history["d"].append(self.d)

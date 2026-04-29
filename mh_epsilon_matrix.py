@@ -19,15 +19,15 @@ def article_matrix_paper(e1: float, e2: float) -> list[list[float]]:
     Path row i corresponds to article Path i+1; column j to Hop j+1.
     """
     # MP-MH
-    # return [
-    #     [e1, 0.6, 0.3],
-    #     [0.8, e1, e1],
-    #     [0.2, e2, 0.7],
-    #     [e2, 0.4, e2],
-    # ]
+    return [
+        [e1, 0.6, 0.3],
+        [0.8, e1, e1],
+        [0.2, e2, 0.7],
+        [e2, 0.4, e2],
+    ]
 
     # MP 
-    return [[e1], [e2], [0.2], [0.8]]
+    # return [[e1], [e2], [0.2], [0.8]]
 
 
 def validate_article_matrix(

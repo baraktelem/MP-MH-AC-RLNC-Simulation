@@ -297,17 +297,18 @@ def _run_main(*, debug: bool = False) -> None:
 
     eps_values = list(np.arange(0.1, 0.9, 0.1))
     NUM_PATHS = DEFAULT_NUM_PATHS
-    # NUM_HOPS = DEFAULT_NUM_HOPS
-    NUM_HOPS = 1
+    NUM_HOPS = DEFAULT_NUM_HOPS
+    # NUM_HOPS = 1
     num_hops_eff = effective_num_hops(NUM_HOPS)
 
-    # RTT = 12
-    RTT = 20
+    RTT = 12
+    # RTT = 20
     PROP_DELAY = RTT // 2
     THRESHOLD = 0.0
     k_mp = NUM_PATHS * (RTT - 1)
     O_BAR = 2 * NUM_PATHS * (RTT - 1)
-    NUM_PACKETS_TO_SEND = 200
+    # NUM_PACKETS_TO_SEND = 200
+    NUM_PACKETS_TO_SEND = 500
     MAX_ITERATIONS = None
     NUM_ITERATIONS = 150
     LOAD_EXISTING = False
