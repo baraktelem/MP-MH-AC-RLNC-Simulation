@@ -275,9 +275,13 @@ class NodeReceiver(GeneralReceiver):
         self.global_paths_rlnc_types = {}
         super().run_step(time)
         # Mark all dropped packets in mapping
-        for path_idx in range(1,self.num_of_input_paths+1):
-            if self.global_paths_rlnc_types.get(path_idx, None) is None:
-                self.global_paths_rlnc_types[path_idx] = NodeRLNCType.DROPPED
+        for path in self.receiver_paths: # Iterate over paths instead of over indices as old code
+            global_path_idx = path.get_global_path_index()
+            if self.global_paths_rlnc_types.get(global_path_idx, None) is None:
+                self.global_paths_rlnc_types[global_path_idx] = NodeRLNCType.DROPPED
+        # for path_idx in range(1,self.num_of_input_paths+1): # Old code - Iterate over indices instead of paths
+        #     if self.global_paths_rlnc_types.get(path_idx, None) is None:
+        #         self.global_paths_rlnc_types[path_idx] = NodeRLNCType.DROPPED
     
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         """This function is called for each RLNC that arrives on a path. It does the following:

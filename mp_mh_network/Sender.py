@@ -647,7 +647,8 @@ class SimSender(GeneralSender):
         # Run step for all remaining paths and receiver
         for path in self.remaining_paths_for_transmission: # When the simulation ends, there will be no remaining paths for transmission
             path.run_forward_channel_step(current_time=self.t)
-        self.next_hop.run_step()
+        if hasattr(self.next_hop, 'run_step'):
+            self.next_hop.run_step()
 
     def get_all_rlnc_history(self) -> list[RLNCPacket]:
         return self.sent_new_rlnc_history + self.sent_fec_history + self.sent_fb_fec_history
@@ -777,6 +778,8 @@ class NodeSender(GeneralSender):
         return self.parent_node.get_receiver_correction_information_packets()
 
     def perform_natural_matching(self):
+        if len(self.paths) <= 1:
+            return # No need to perform natural matching if there is only one path
         global_paths_idx_by_r = self.get_global_paths_by_r()
         
         # Sort local paths by r in descending order

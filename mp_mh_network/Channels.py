@@ -1,5 +1,5 @@
 import random
-from copy import deepcopy
+from copy import copy
 from Packet import Packet, RLNCPacket, RLNCType, PacketID, FeedbackPacket
 
 class Path:
@@ -128,7 +128,7 @@ class Channel:
             print(f"[{self.channel_name}]: All packets still in channel:\n\t{self.packets_in_channel}")
     
     def add_packet_to_history(self, packet):
-        self.channel_history.append(deepcopy(packet))
+        self.channel_history.append(copy(packet))
 
     def get_channel_history(self) -> list[Packet]:
         return self.channel_history
@@ -215,7 +215,6 @@ class ForwardChannel(Channel):
     #         dropped = True
     #         self.dropped_packets.append(packet)
     #     return packet, dropped
-
 
     def run_step(self, current_time: int) -> RLNCPacket | None:
         """Run step for forward channel
