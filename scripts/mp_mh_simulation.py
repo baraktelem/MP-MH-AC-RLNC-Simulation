@@ -25,6 +25,10 @@ from __future__ import annotations
 import os
 import pickle
 import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 from collections import defaultdict
 from datetime import datetime
 

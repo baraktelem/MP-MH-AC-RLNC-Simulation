@@ -12,11 +12,252 @@ Usage:
 """
 import sys
 import os
-from mp_simulation import load_results, plot_stats, aggregate_results
+import pickle
+from pathlib import Path
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "jamming_simulation"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from pathlib import Path
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+
+from mp_simulation import plot_stats, aggregate_results
+from jam_mp_mh_simulation import plot_per_k_surfaces, network_min_cut_capacity
+
+
+# ---------------------------------------------------------------------------
+# Format detection + loading (supports flat list and jam per-k dict)
+# ---------------------------------------------------------------------------
+
+def is_per_k_results(obj) -> bool:
+    """True when obj is {k: [(e1, e2, stats), ...]} from jam sweep_eps_grid_per_k.
+
+    Tolerates empty value lists (a partial pickle written by the incremental
+    per-k save during a run that hasn't yet started one or more k values).
+    Requires at least one k to have non-empty data so the format can be
+    distinguished from arbitrary {int: list} dicts.
+    """
+    if not isinstance(obj, dict) or not obj:
+        return False
+    saw_any_data = False
+    for key, value in obj.items():
+        if not isinstance(key, int) or not isinstance(value, list):
+            return False
+        if not value:
+            continue  # partial pickle: this k hasn't started yet
+        saw_any_data = True
+        first = value[0]
+        if not isinstance(first, tuple) or len(first) != 3:
+            return False
+    return saw_any_data
+
+
+def load_results_any(filename: str):
+    """Load a pickle; supports flat list (mp_mh_simulation.py) and jam per-k
+    dict (jam_mp_mh_simulation.py sweep_eps_grid_per_k) formats."""
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Results file not found: {filename}")
+    with open(filename, "rb") as f:
+        results = pickle.load(f)
+
+    print(f"[OK] Results loaded from: {filename}")
+    if is_per_k_results(results):
+        non_empty = {k: v for k, v in results.items() if v}
+        empty_ks = sorted(set(results) - set(non_empty))
+        total = sum(len(v) for v in non_empty.values())
+        print(
+            f"     Per-k format: {len(results)} k value(s) "
+            f"({len(non_empty)} non-empty, {len(empty_ks)} empty), "
+            f"{total} total data points"
+        )
+        if empty_ks:
+            print(f"     Empty k value(s) (skipped in plot): {empty_ks}")
+    else:
+        print(f"     Total data points: {len(results)}")
+    return results
+
+
+def _snap_agg_keys(
+    agg: dict[tuple[float, float], dict], ndigits: int = 2
+) -> dict[tuple[float, float], dict]:
+    """Snap (e1, e2) keys to ndigits decimals so pickles produced with
+    np.arange-derived floats (which drift to e.g. 0.30000000000000004) align
+    with pickles produced via rounded `round(float(v), 2)` floats. Without
+    this, a set-union over their keys yields phantom grid points and
+    plot_surface produces spike artifacts at the misaligned cells."""
+    snapped: dict[tuple[float, float], dict] = {}
+    for (e1, e2), v in agg.items():
+        snapped[(round(float(e1), ndigits), round(float(e2), ndigits))] = v
+    return snapped
+
+
+def aggregate_per_k_results(
+    per_k_results: dict[int, list],
+) -> dict[int, dict[tuple[float, float], dict]]:
+    """Aggregate per-k results, dropping any k whose result list is empty
+    (which happens with a partial pickle from an interrupted/in-progress run).
+    Snaps (e1, e2) keys to 2 decimals to keep grids stable across pickles."""
+    return {k: _snap_agg_keys(aggregate_results(rs)) for k, rs in per_k_results.items() if rs}
+
+
+def infer_eps_grid(
+    aggregated_per_k: dict[int, dict[tuple[float, float], dict]],
+) -> tuple[list[float], list[float]]:
+    eps1 = sorted({e1 for agg in aggregated_per_k.values() for e1, _ in agg})
+    eps2 = sorted({e2 for agg in aggregated_per_k.values() for _, e2 in agg})
+    return eps1, eps2
+
+
+def plot_per_k_stats(
+    per_k_results: dict[int, list],
+    *,
+    title_suffix: str,
+    plot_path: str,
+    num_hops_eff: int = 3,
+) -> None:
+    aggregated_per_k = aggregate_per_k_results(per_k_results)
+    if not aggregated_per_k:
+        print("[ERROR] No completed k values to plot.")
+        return
+    eps1, eps2 = infer_eps_grid(aggregated_per_k)
+    # Use the same NetworkX min-cut as mp_mh_simulation.py so the reference
+    # surface is directly comparable. None/no surface if NetworkX missing.
+    cap_value = network_min_cut_capacity(eps1[0], eps2[0], num_hops_eff)
+    capacity_func = (
+        (lambda e1, e2: network_min_cut_capacity(e1, e2, num_hops_eff))
+        if cap_value is not None else None
+    )
+    plot_per_k_surfaces(
+        aggregated_per_k,
+        eps_values_e1=eps1,
+        eps_values_e2=eps2,
+        title_suffix=title_suffix,
+        plot_path=plot_path,
+        capacity_func=capacity_func,
+        capacity_label="Min-cut capacity (NetworkX, layered BEC)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Combined overlay (mix of flat-list and per-k pickles on the same axes)
+# ---------------------------------------------------------------------------
+
+def plot_overlay_surfaces(
+    series: list[tuple[str, dict[tuple[float, float], dict]]],
+    *,
+    eps_values_e1: list[float],
+    eps_values_e2: list[float],
+    title_suffix: str,
+    plot_path: str,
+    capacity_surfaces: list[tuple[str, callable, str]] | None = None,
+) -> None:
+    """3 subplots (throughput / mean delay / max delay). Each entry in `series`
+    contributes one alpha-blended surface per subplot in a distinct tab10 color
+    with a legend entry. `capacity_surfaces` (optional) is a list of
+    (label, func(e1,e2)->float, color) tuples added only to the throughput
+    subplot as transparent reference surfaces."""
+    n_e1 = len(eps_values_e1)
+    n_e2 = len(eps_values_e2)
+    EPS1, EPS2 = np.meshgrid(eps_values_e1, eps_values_e2)
+
+    cmap = plt.get_cmap("tab10")
+    color_for = lambda i: cmap(i % 10)
+
+    metrics = [
+        ("throughput_mean", "Normalized Throughput"),
+        ("delay_mean_mean", "Mean In-Order Delay"),
+        ("delay_max_mean", "Max In-Order Delay"),
+    ]
+
+    fig = plt.figure(figsize=(20, 6))
+    for subplot_idx, (metric_key, metric_label) in enumerate(metrics):
+        ax = fig.add_subplot(1, 3, subplot_idx + 1, projection="3d")
+        max_z = 0.0
+        legend_patches = []
+
+        for s_idx, (label, agg) in enumerate(series):
+            grid = np.zeros((n_e1, n_e2))
+            for i, e1 in enumerate(eps_values_e1):
+                for j, e2 in enumerate(eps_values_e2):
+                    grid[i, j] = agg.get((e1, e2), {}).get(metric_key, 0.0)
+            max_z = max(max_z, float(np.max(grid)))
+            color = color_for(s_idx)
+            ax.plot_surface(
+                EPS1, EPS2, grid.T,
+                color=color, edgecolor="none", alpha=0.4,
+            )
+            from matplotlib.patches import Patch
+            legend_patches.append(Patch(color=color, label=label, alpha=0.4))
+
+        if subplot_idx == 0 and capacity_surfaces:
+            for cap_label, cap_func, cap_color in capacity_surfaces:
+                cap_grid = np.zeros((n_e1, n_e2))
+                for i, e1 in enumerate(eps_values_e1):
+                    for j, e2 in enumerate(eps_values_e2):
+                        cap_grid[i, j] = float(cap_func(e1, e2))
+                max_z = max(max_z, float(np.max(cap_grid)))
+                ax.plot_surface(
+                    EPS1, EPS2, cap_grid.T,
+                    color=cap_color, edgecolor="none", alpha=0.2,
+                )
+                from matplotlib.patches import Patch
+                legend_patches.append(Patch(color=cap_color, label=cap_label, alpha=0.2))
+
+        ax.set_xlabel("ε₁")
+        ax.set_ylabel("ε₂")
+        ax.set_zlabel(metric_label)
+        ax.set_title(metric_label)
+        ax.set_zlim(0, max(0.1, max_z * 1.1))
+        ax.view_init(elev=20, azim=45)
+        ax.legend(handles=legend_patches, fontsize=8, loc="upper left")
+
+    fig.suptitle(title_suffix, fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=200, bbox_inches="tight")
+    print(f"[OK] Plot saved to: {plot_path}")
+    plt.show()
+
+
+def _eps_grid_from_aggs(aggs: list[dict[tuple[float, float], dict]]) -> tuple[list[float], list[float]]:
+    eps1 = sorted({e1 for agg in aggs for e1, _ in agg})
+    eps2 = sorted({e2 for agg in aggs for _, e2 in agg})
+    return eps1, eps2
+
+
+def build_overlay_series_and_capacities(
+    flat_datasets: list[tuple[str, list]],
+    per_k_datasets: list[tuple[str, dict, str]],
+    *,
+    num_hops_eff: int = 3,
+) -> tuple[list[tuple[str, dict]], list[tuple[str, callable, str]]]:
+    """Build (series, capacity_surfaces) from raw loaded datasets."""
+    series: list[tuple[str, dict]] = []
+    for label, results in flat_datasets:
+        series.append((label, _snap_agg_keys(aggregate_results(results))))
+    for label, per_k_results, _filepath in per_k_datasets:
+        for k in sorted(per_k_results.keys()):
+            if not per_k_results[k]:
+                continue
+            agg = _snap_agg_keys(aggregate_results(per_k_results[k]))
+            series.append((f"{label} k={k}", agg))
+
+    # Single shared capacity surface -- the same NetworkX min-cut used by
+    # mp_mh_simulation.py. Both protocols share this reference because the
+    # underlying graph capacity is identical; only the protocol's ability to
+    # exploit it differs.
+    capacity_surfaces: list[tuple[str, callable, str]] = []
+    if (flat_datasets or per_k_datasets) and network_min_cut_capacity(0.1, 0.1, num_hops_eff) is not None:
+        capacity_surfaces.append((
+            "Min-cut capacity (NetworkX, layered BEC)",
+            lambda e1, e2: network_min_cut_capacity(e1, e2, num_hops_eff),
+            "red",
+        ))
+
+    return series, capacity_surfaces
 
 def plot_stats_comparison(datasets: list[tuple[str, list]]):
     """
@@ -222,8 +463,9 @@ if __name__ == "__main__":
         print("[ERROR] No valid result files found!")
         sys.exit(1)
     
-    # Load results from all files
-    datasets = []
+    # Load results from all files; auto-route per-k vs flat-list formats
+    flat_datasets: list[tuple[str, list]] = []
+    per_k_datasets: list[tuple[str, dict, str]] = []
     print(f"\nLoading {len(valid_files)} result file(s)...")
     print("="*70)
     
@@ -231,23 +473,58 @@ if __name__ == "__main__":
         # Extract label from filename (remove path and extension)
         label = os.path.splitext(os.path.basename(filepath))[0]
         
-        # Load results
-        results = load_results(filepath)
-        datasets.append((label, results))
+        results = load_results_any(filepath)
+        if is_per_k_results(results):
+            per_k_datasets.append((label, results, str(filepath)))
+        else:
+            flat_datasets.append((label, results))
     
     # Plot
     print(f"\n{'='*70}")
     print("Generating plots...")
     print("="*70)
     
-    if len(datasets) == 1:
+    # Mixed flat + per-k, OR multiple per-k pickles -> unified overlay path
+    if (flat_datasets and per_k_datasets) or len(per_k_datasets) > 1:
+        print(
+            f"Mixed/multiple datasets -> overlay plot "
+            f"({len(flat_datasets)} flat, {len(per_k_datasets)} per-k)"
+        )
+        series, capacity_surfaces = build_overlay_series_and_capacities(
+            flat_datasets, per_k_datasets
+        )
+        if not series:
+            print("[ERROR] No data to plot (all per-k datasets were empty).")
+            sys.exit(1)
+        eps1, eps2 = _eps_grid_from_aggs([agg for _label, agg in series])
+        labels_blob = " + ".join(
+            [lbl for lbl, _ in flat_datasets] + [lbl for lbl, _, _ in per_k_datasets]
+        )
+        plot_overlay_surfaces(
+            series,
+            eps_values_e1=eps1,
+            eps_values_e2=eps2,
+            title_suffix=f"Overlay: {labels_blob}",
+            plot_path="combined_overlay.png",
+            capacity_surfaces=capacity_surfaces,
+        )
+    elif len(per_k_datasets) == 1:
+        label, results, filepath = per_k_datasets[0]
+        print("Single per-k dataset - using overlaid surface plot")
+        plot_stem = os.path.splitext(os.path.basename(filepath))[0]
+        plot_per_k_stats(
+            results,
+            title_suffix=f"{label} (1 surface per k)",
+            plot_path=f"{plot_stem}.png",
+        )
+    elif len(flat_datasets) == 1:
         # Single dataset - use original plotting function
         print("Single protocol - using standard plot")
-        plot_stats(datasets[0][1])
+        plot_stats(flat_datasets[0][1])
     else:
-        # Multiple datasets - use comparison plotting function
-        print(f"Comparing {len(datasets)} protocols")
-        plot_stats_comparison(datasets)
+        # Multiple flat datasets - use comparison plotting function
+        print(f"Comparing {len(flat_datasets)} protocols")
+        plot_stats_comparison(flat_datasets)
     
     print(f"\n{'='*70}")
     print("Plots saved successfully!")

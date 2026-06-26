@@ -18,12 +18,18 @@ Configuration:
     - RESULTS_FILE: Filename for saving/loading results (default: simulation_results.pkl)
     - NUM_ITERATIONS: Number of iterations to run for each parameter combination
 """
+import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
+
 from Network import MPNetwork, SimulationStats
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import pickle
-import os
 from datetime import datetime
 
 def save_results(results: list[tuple[float, float, SimulationStats]], filename: str = None):

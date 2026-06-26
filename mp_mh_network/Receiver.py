@@ -39,7 +39,7 @@ class ReceiverPath(Path):
         feedback_packet = super().send_feedback_packet(feedback_packet, current_time)
         if feedback_packet is not None:
             self.sim_print(f"Feedback packet sent:\n\t{feedback_packet}")
-            self.my_receiver.add_sent_feedback_packet_to_history(copy.deepcopy(feedback_packet))
+            self.my_receiver.add_sent_feedback_packet_to_history(copy.copy(feedback_packet))
         return feedback_packet
 
     def update_receiving_packets_strating_time(self, arrived_packet: RLNCPacket, time: int):

@@ -58,6 +58,7 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
 
@@ -91,6 +92,35 @@ def chain_major_epsilons(e1: float, e2: float, num_hops: int) -> list[list[float
 
 def uniform_chain_major_epsilons(eps: float, num_paths: int, num_hops: int) -> list[list[float]]:
     return [[eps for _ in range(num_hops)] for _ in range(num_paths)]
+
+
+def chain_min_cut_capacity(e1: float, e2: float, num_hops_eff: int = 3) -> float:
+    """Per-chain bottleneck bound: sum_c min_h(1 - eps[c][h]) for the paper
+    article template at (e1, e2). NOT used as the default capacity reference,
+    because it ignores the cross-chain coding gain that AC-RLNC achieves at
+    the receiver -- empirically `k=0` throughput exceeds this number, so it
+    is a *too-pessimistic* bound for our protocol. Kept here for reference."""
+    article = article_matrix_for_hops(e1, e2, num_hops_eff)
+    return sum(min(1.0 - eps for eps in chain) for chain in article)
+
+
+# The "real" capacity reference: the same MpMhNetwork min-cut used by
+# mp_mh_simulation.py. Computed via a layered BEC max-flow and accounts for
+# cross-path coding gain. Wrapped here so callers don't need to know the
+# exact module path; gracefully degrades to None if NetworkX is unavailable.
+try:
+    from mh_min_cut_capacity import min_cut_capacity_for_epsilons as _mp_mh_min_cut
+except Exception:  # pragma: no cover -- NetworkX missing
+    _mp_mh_min_cut = None
+
+
+def network_min_cut_capacity(e1: float, e2: float, num_hops_eff: int = 3) -> float | None:
+    """The MpMhNetwork min-cut capacity for the paper article template at
+    (e1, e2). Same function used by mp_mh_simulation.py for the red reference
+    surface. Returns None if NetworkX (its dependency) isn't installed."""
+    if _mp_mh_min_cut is None:
+        return None
+    return float(_mp_mh_min_cut(e1, e2, num_hops_eff))
 
 
 def _zero_stats(num_packets_sent: int = 0) -> SimulationStats:
@@ -340,12 +370,20 @@ def plot_per_k_surfaces(
     eps_values_e2: list[float],
     title_suffix: str,
     plot_path: str,
+    capacity_func=None,
+    capacity_label: str = "Chain min-cut capacity",
+    capacity_color: str = "red",
 ) -> None:
     """Three 3D subplots (throughput / mean delay / max delay). Each subplot
     overlays one alpha-blended surface per k value (distinct color per k)
     on the same (eps1, eps2) base grid. Mirrors mp_mh_simulation.py's
     surface style so JamMpMhNetwork(k=0) can be visually compared against
-    MpMhNetwork output produced by mp_mh_simulation.py."""
+    MpMhNetwork output produced by mp_mh_simulation.py.
+
+    capacity_func (optional): callable (e1, e2) -> float that returns a
+    capacity bound. Plotted as a transparent reference surface ON THE
+    THROUGHPUT SUBPLOT ONLY. For JamMpMhNetwork, pass `chain_min_cut_capacity`.
+    """
     n_e1 = len(eps_values_e1)
     n_e2 = len(eps_values_e2)
     EPS1, EPS2 = np.meshgrid(eps_values_e1, eps_values_e2)
@@ -384,16 +422,36 @@ def plot_per_k_surfaces(
                 alpha=0.4,
             )
 
+        legend_patches = [
+            Patch(color=color_for(i), label=f"k={k}", alpha=0.4)
+            for i, k in enumerate(sorted_ks)
+        ]
+
+        # Capacity reference surface goes only on the throughput subplot
+        if subplot_idx == 0 and capacity_func is not None:
+            cap_grid = np.zeros((n_e1, n_e2))
+            for i, e1 in enumerate(eps_values_e1):
+                for j, e2 in enumerate(eps_values_e2):
+                    cap_grid[i, j] = float(capacity_func(e1, e2))
+            max_z = max(max_z, float(np.max(cap_grid)))
+            ax.plot_surface(
+                EPS1,
+                EPS2,
+                cap_grid.T,
+                color=capacity_color,
+                edgecolor="none",
+                alpha=0.2,
+            )
+            legend_patches.append(
+                Patch(color=capacity_color, label=capacity_label, alpha=0.2)
+            )
+
         ax.set_xlabel("ε₁")
         ax.set_ylabel("ε₂")
         ax.set_zlabel(metric_label)
         ax.set_title(f"{metric_label} (1 surface per k)")
         ax.set_zlim(0, max(0.1, max_z * 1.1))
         ax.view_init(elev=20, azim=45)
-        legend_patches = [
-            Patch(color=color_for(i), label=f"k={k}", alpha=0.4)
-            for i, k in enumerate(sorted_ks)
-        ]
         ax.legend(handles=legend_patches, fontsize=8, loc="upper left")
 
     fig.suptitle(title_suffix, fontsize=12, fontweight="bold")
@@ -423,6 +481,83 @@ def load_pickle(filename: str):
 
 
 # ---------------------------------------------------------------------------
+# Parallel sim runner
+# ---------------------------------------------------------------------------
+
+def _run_one_sim_task(args: tuple) -> tuple:
+    """Top-level worker for ProcessPoolExecutor (must be picklable -- defined at
+    module level). Runs one JamMpMhNetwork sim and returns its result tagged
+    with the original task identity.
+
+    args: (group_key, k, e1, e2, it, alpha,
+           num_paths, num_hops, rtt, threshold, o_bar,
+           num_packets_to_send, max_iterations, initial_epsilon)
+    """
+    (
+        group_key,
+        k,
+        e1,
+        e2,
+        it,
+        alpha,
+        num_paths,
+        num_hops,
+        rtt,
+        threshold,
+        o_bar,
+        num_packets_to_send,
+        max_iterations,
+        initial_epsilon,
+    ) = args
+    eps_matrix = chain_major_epsilons(e1, e2, num_hops)
+    stats = run_jam_network(
+        path_eps_chain_major=eps_matrix,
+        num_paths=num_paths,
+        num_hops=num_hops,
+        rtt=rtt,
+        threshold=threshold,
+        o_bar=o_bar,
+        num_packets_to_send=num_packets_to_send,
+        max_iterations=max_iterations,
+        jammer_alpha=alpha,
+        jammer_k=k,
+        initial_epsilon=initial_epsilon,
+        debug=False,
+    )
+    return (group_key, k, float(e1), float(e2), it, alpha, stats)
+
+
+def _execute_tasks(
+    tasks: list[tuple],
+    *,
+    parallel_workers: int,
+    progress_label: str,
+):
+    """Execute sim tasks either serially (parallel_workers <= 1) or via a
+    ProcessPoolExecutor. Yields (task_idx, result_tuple) as results complete.
+    With parallel execution, results arrive in arbitrary order; the caller
+    must use group_key inside result_tuple to route results to the right
+    bucket. Prints a per-task progress line tagged with the order index."""
+    total = len(tasks)
+    print(
+        f"\n[{progress_label}] running {total} sims with parallel_workers={parallel_workers}\n"
+    )
+
+    if parallel_workers is None or parallel_workers <= 1:
+        for idx, task in enumerate(tasks, start=1):
+            yield idx, _run_one_sim_task(task)
+    else:
+        with ProcessPoolExecutor(max_workers=parallel_workers) as pool:
+            future_to_idx = {
+                pool.submit(_run_one_sim_task, task): idx
+                for idx, task in enumerate(tasks, start=1)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                yield idx, future.result()
+
+
+# ---------------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------------
 
@@ -444,38 +579,48 @@ def mode_sweep_k(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    parallel_workers: int = 1,
 ) -> None:
     if load_existing and os.path.exists(results_file):
         results = load_pickle(results_file)
     else:
-        eps = chain_major_epsilons(e1, e2, num_hops)
-        results: list[tuple[int, SimulationStats]] = []
-        total = num_iterations * len(k_values)
-        sim = 0
+        tasks: list[tuple] = []
         for it in range(1, num_iterations + 1):
             for k in k_values:
-                sim += 1
-                stats = run_jam_network(
-                    path_eps_chain_major=eps,
-                    num_paths=num_paths,
-                    num_hops=num_hops,
-                    rtt=rtt,
-                    threshold=threshold,
-                    o_bar=o_bar,
-                    num_packets_to_send=num_packets_to_send,
-                    max_iterations=max_iterations,
-                    jammer_alpha=jammer_alpha,
-                    jammer_k=k,
-                    initial_epsilon=initial_epsilon,
-                    debug=False,
-                )
-                results.append((k, stats))
-                print(
-                    f"[{sim}/{total}] iter {it}/{num_iterations} k={k:>2} "
-                    f"-> tp={stats.normalized_throughput:.4f} "
-                    f"delay_mean={stats.inorder_delay_mean:.2f} "
-                    f"decoded={stats.num_information_packets_decoded}"
-                )
+                tasks.append((
+                    k,
+                    k,
+                    float(e1),
+                    float(e2),
+                    it,
+                    jammer_alpha,
+                    num_paths,
+                    num_hops,
+                    rtt,
+                    threshold,
+                    o_bar,
+                    num_packets_to_send,
+                    max_iterations,
+                    initial_epsilon,
+                ))
+
+        results: list[tuple[int, SimulationStats]] = []
+        total = len(tasks)
+        completed = 0
+        for _, result in _execute_tasks(
+            tasks,
+            parallel_workers=parallel_workers,
+            progress_label="sweep_k",
+        ):
+            (_gk, k, _e1, _e2, it, _alpha, stats) = result
+            results.append((k, stats))
+            completed += 1
+            print(
+                f"[{completed}/{total}] iter {it}/{num_iterations} k={k:>2} "
+                f"-> tp={stats.normalized_throughput:.4f} "
+                f"delay_mean={stats.inorder_delay_mean:.2f} "
+                f"decoded={stats.num_information_packets_decoded}"
+            )
         save_pickle(results, results_file, prefix="jam_sweep_k")
 
     aggregated = aggregate_by_key(results)
@@ -667,43 +812,61 @@ def mode_sweep_k_multi_eps(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    parallel_workers: int = 1,
 ) -> None:
     """Sweep jammer_k for each (e1, e2) in eps_pairs and overlay all curves
     on one figure (3 subplots: throughput / mean delay / max delay)."""
     if load_existing and os.path.exists(results_file):
         per_eps_results = load_pickle(results_file)
     else:
-        per_eps_results: dict[tuple[float, float], list[tuple[int, SimulationStats]]] = {}
-        total = num_iterations * len(k_values) * len(eps_pairs)
-        sim = 0
+        per_eps_target_count = num_iterations * len(k_values)
+        tasks: list[tuple] = []
         for (e1, e2) in eps_pairs:
-            eps = chain_major_epsilons(e1, e2, num_hops)
-            results: list[tuple[int, SimulationStats]] = []
             for it in range(1, num_iterations + 1):
                 for k in k_values:
-                    sim += 1
-                    stats = run_jam_network(
-                        path_eps_chain_major=eps,
-                        num_paths=num_paths,
-                        num_hops=num_hops,
-                        rtt=rtt,
-                        threshold=threshold,
-                        o_bar=o_bar,
-                        num_packets_to_send=num_packets_to_send,
-                        max_iterations=max_iterations,
-                        jammer_alpha=jammer_alpha,
-                        jammer_k=k,
-                        initial_epsilon=initial_epsilon,
-                        debug=False,
-                    )
-                    results.append((k, stats))
-                    print(
-                        f"[{sim}/{total}] e1={e1:.2f} e2={e2:.2f} "
-                        f"iter {it}/{num_iterations} k={k:>2} "
-                        f"-> tp={stats.normalized_throughput:.4f} "
-                        f"delay_mean={stats.inorder_delay_mean:.2f}"
-                    )
-            per_eps_results[(e1, e2)] = results
+                    tasks.append((
+                        (float(e1), float(e2)),  # group_key
+                        k,
+                        float(e1),
+                        float(e2),
+                        it,
+                        jammer_alpha,
+                        num_paths,
+                        num_hops,
+                        rtt,
+                        threshold,
+                        o_bar,
+                        num_packets_to_send,
+                        max_iterations,
+                        initial_epsilon,
+                    ))
+
+        per_eps_results: dict[tuple[float, float], list[tuple[int, SimulationStats]]] = {
+            (float(e1), float(e2)): [] for (e1, e2) in eps_pairs
+        }
+        per_eps_complete: dict[tuple[float, float], int] = {
+            (float(e1), float(e2)): 0 for (e1, e2) in eps_pairs
+        }
+        total = len(tasks)
+        completed = 0
+        for _, result in _execute_tasks(
+            tasks,
+            parallel_workers=parallel_workers,
+            progress_label="sweep_k_multi_eps",
+        ):
+            (group_key, k, e1, e2, it, _alpha, stats) = result
+            per_eps_results[group_key].append((k, stats))
+            per_eps_complete[group_key] += 1
+            completed += 1
+            print(
+                f"[{completed}/{total}] e1={e1:.2f} e2={e2:.2f} "
+                f"iter {it}/{num_iterations} k={k:>2} "
+                f"-> tp={stats.normalized_throughput:.4f} "
+                f"delay_mean={stats.inorder_delay_mean:.2f}"
+            )
+            if per_eps_complete[group_key] == per_eps_target_count:
+                save_pickle(per_eps_results, results_file, prefix="jam_sweep_k_multi_eps")
+                print(f"[checkpoint] (e1={e1:.2f}, e2={e2:.2f}) complete -> saved partial pickle")
         save_pickle(per_eps_results, results_file, prefix="jam_sweep_k_multi_eps")
 
     series: dict[str, dict[int | float, dict]] = {}
@@ -738,6 +901,7 @@ def mode_sweep_eps_grid_per_k(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    parallel_workers: int = 1,
 ) -> None:
     """Sweep (e1, e2) over the eps_values × eps_values grid (mp_mh_simulation.py
     convention) for each k in k_values, and plot one 3D surface per k overlaid
@@ -745,45 +909,65 @@ def mode_sweep_eps_grid_per_k(
 
     With k=0 the resulting surface is directly comparable to the surfaces
     produced by mp_mh_simulation.py; differences reflect the chain topology
-    (independent chains vs layered cascade)."""
+    (independent chains vs layered cascade).
+
+    Set parallel_workers > 1 to run sims across CPU cores (uses
+    concurrent.futures.ProcessPoolExecutor). Pickle is saved incrementally
+    after each k completes, so a crash only loses the in-progress k."""
     eps_sorted = sorted(eps_values)
 
     if load_existing and os.path.exists(results_file):
         per_k_results = load_pickle(results_file)
     else:
-        per_k_results: dict[int, list[tuple[float, float, SimulationStats]]] = {}
-        total_per_k = num_iterations * len(eps_sorted) ** 2
-        total = total_per_k * len(k_values)
-        sim = 0
+        per_k_target_count = num_iterations * len(eps_sorted) ** 2
+        tasks: list[tuple] = []
         for k in k_values:
-            results: list[tuple[float, float, SimulationStats]] = []
             for it in range(1, num_iterations + 1):
                 for e1 in eps_sorted:
                     for e2 in eps_sorted:
-                        sim += 1
-                        eps_matrix = chain_major_epsilons(e1, e2, num_hops)
-                        stats = run_jam_network(
-                            path_eps_chain_major=eps_matrix,
-                            num_paths=num_paths,
-                            num_hops=num_hops,
-                            rtt=rtt,
-                            threshold=threshold,
-                            o_bar=o_bar,
-                            num_packets_to_send=num_packets_to_send,
-                            max_iterations=max_iterations,
-                            jammer_alpha=jammer_alpha,
-                            jammer_k=k,
-                            initial_epsilon=initial_epsilon,
-                            debug=False,
-                        )
-                        results.append((float(e1), float(e2), stats))
-                        print(
-                            f"[{sim}/{total}] k={k:>2} iter {it}/{num_iterations} "
-                            f"e1={e1:.1f} e2={e2:.1f} -> "
-                            f"tp={stats.normalized_throughput:.4f} "
-                            f"delay_mean={stats.inorder_delay_mean:.2f}"
-                        )
-            per_k_results[k] = results
+                        tasks.append((
+                            k,                       # group_key
+                            k,
+                            float(e1),
+                            float(e2),
+                            it,
+                            jammer_alpha,
+                            num_paths,
+                            num_hops,
+                            rtt,
+                            threshold,
+                            o_bar,
+                            num_packets_to_send,
+                            max_iterations,
+                            initial_epsilon,
+                        ))
+
+        per_k_results: dict[int, list[tuple[float, float, SimulationStats]]] = {
+            k: [] for k in k_values
+        }
+        per_k_complete: dict[int, int] = {k: 0 for k in k_values}
+        total = len(tasks)
+        completed = 0
+
+        for _, result in _execute_tasks(
+            tasks,
+            parallel_workers=parallel_workers,
+            progress_label="sweep_eps_grid_per_k",
+        ):
+            (group_key, k, e1, e2, it, _alpha, stats) = result
+            per_k_results[group_key].append((e1, e2, stats))
+            per_k_complete[group_key] += 1
+            completed += 1
+            print(
+                f"[{completed}/{total}] k={k:>2} iter {it}/{num_iterations} "
+                f"e1={e1:.1f} e2={e2:.1f} -> "
+                f"tp={stats.normalized_throughput:.4f} "
+                f"delay_mean={stats.inorder_delay_mean:.2f}"
+            )
+            if per_k_complete[group_key] == per_k_target_count:
+                save_pickle(per_k_results, results_file, prefix="jam_sweep_eps_grid_per_k")
+                print(f"[checkpoint] k={group_key} complete -> saved partial pickle")
+
         save_pickle(per_k_results, results_file, prefix="jam_sweep_eps_grid_per_k")
 
     aggregated_per_k: dict[int, dict[tuple[float, float], dict]] = {}
@@ -808,6 +992,15 @@ def mode_sweep_eps_grid_per_k(
             for key, v in grouped.items()
         }
 
+    # Use the same NetworkX min-cut as mp_mh_simulation.py so the capacity
+    # reference is directly comparable. Falls back to no capacity surface if
+    # NetworkX isn't installed.
+    capacity_func = None
+    capacity_label = "Min-cut capacity"
+    if _mp_mh_min_cut is not None:
+        capacity_func = lambda e1, e2: float(_mp_mh_min_cut(e1, e2, num_hops))
+        capacity_label = "Min-cut capacity (NetworkX, layered BEC)"
+
     plot_per_k_surfaces(
         aggregated_per_k,
         eps_values_e1=eps_sorted,
@@ -817,6 +1010,8 @@ def mode_sweep_eps_grid_per_k(
             f"alpha={jammer_alpha}, RTT={rtt}); compare k=0 surface to mp_mh_simulation.py output"
         ),
         plot_path=plot_file,
+        capacity_func=capacity_func,
+        capacity_label=capacity_label,
     )
 
 
@@ -847,6 +1042,12 @@ def _run_main() -> None:
     MODE = "sweep_eps_grid_per_k"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_alpha", "validate_k0"
     LOAD_EXISTING = False
 
+    # Parallelization for the heavy sweep modes (sweep_k, sweep_k_multi_eps,
+    # sweep_eps_grid_per_k). 1 = serial. A safe default is os.cpu_count() // 2
+    # to leave headroom for the OS / other apps. Set to os.cpu_count() to use
+    # every core. Has no effect on sweep_alpha / validate_k0.
+    PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+
     # sweep_k config
     K_VALUES: list[int] = list(range(0, NUM_PATHS * NUM_HOPS + 1))
     SWEEP_K_ALPHA = 2
@@ -868,7 +1069,8 @@ def _run_main() -> None:
     # one 3D surface per k overlaid on each of the three metric subplots.
     EPS_GRID_VALUES: list[float] = [round(float(v), 2) for v in np.arange(0.1, 0.9, 0.1)]
     # EPS_GRID_K_VALUES: list[int] = [0, 2, 4, 6, 8, 10, 12]
-    EPS_GRID_K_VALUES: list[int] = [0, (NUM_HOPS * NUM_PATHS) // 2, (NUM_HOPS * NUM_PATHS - 1)]
+    tot_paths = NUM_HOPS * NUM_PATHS
+    EPS_GRID_K_VALUES: list[int] = [0, int(0.25 * tot_paths), int(0.5 * tot_paths), int(0.75 * tot_paths)]
     EPS_GRID_RESULTS_FILE = "jam_sweep_eps_grid_per_k_results.pkl"
     EPS_GRID_PLOT_FILE = "jam_sweep_eps_grid_per_k.png"
 
@@ -909,6 +1111,7 @@ def _run_main() -> None:
             results_file=K_RESULTS_FILE,
             plot_file=K_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_k_multi_eps":
         mode_sweep_k_multi_eps(
@@ -927,6 +1130,7 @@ def _run_main() -> None:
             results_file=MULTI_EPS_RESULTS_FILE,
             plot_file=MULTI_EPS_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_eps_grid_per_k":
         mode_sweep_eps_grid_per_k(
@@ -945,6 +1149,7 @@ def _run_main() -> None:
             results_file=EPS_GRID_RESULTS_FILE,
             plot_file=EPS_GRID_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_alpha":
         mode_sweep_alpha(

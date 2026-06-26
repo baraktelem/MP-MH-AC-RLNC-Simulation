@@ -1,7 +1,7 @@
 from Packet import RLNCPacket, FeedbackPacket, RLNCType, NodeRLNCType, FeedbackType, PacketID
 from Channels import Channel, ForwardChannel, Path
 from CodedEquation import CodedEquation
-from copy import deepcopy
+from copy import copy
 
 
 class GeneralSenderPath(Path):
@@ -37,7 +37,7 @@ class GeneralSenderPath(Path):
         self.feedback_channel.run_step()
         self.current_feedbacks = self.pop_arrived_feedback()
         if self.current_feedbacks is not None:
-            self.all_feedback_history.extend(deepcopy(self.current_feedbacks))
+            self.all_feedback_history.extend(copy(self.current_feedbacks))
             self.acked_feedback_history.extend([fb for fb in self.current_feedbacks if fb.type == FeedbackType.ACK])
             self.nacked_feedback_history.extend([fb for fb in self.current_feedbacks if fb.type == FeedbackType.NACK])
             self.update_path_params()
@@ -49,10 +49,10 @@ class GeneralSenderPath(Path):
         return feedbacks if feedbacks is not None else []
     
     def add_packet_to_sent_channel_history(self, packet: RLNCPacket):
-        self.sent_channel_history.append(deepcopy(packet))
+        self.sent_channel_history.append(copy(packet))
 
     def add_packet_to_received_feedback_history(self, packet: FeedbackPacket):
-        self.received_feedback_history.append(deepcopy(packet))
+        self.received_feedback_history.append(copy(packet))
 
     def get_sent_channel_history(self):
         return self.sent_channel_history
@@ -171,7 +171,7 @@ class GeneralSender:
             # Drop feedbacks on packets that wasn't sent (at the end of simulation)
             feedbacks = [fb for fb in feedbacks if fb.get_related_packet_id().get_creation_time() <= self.latest_rlnc_packet_on_air.get_creation_time()]
             self.feedbacks.extend(feedbacks) # Save current feedbacks
-        self.all_feedback_history.extend(deepcopy(self.feedbacks))
+        self.all_feedback_history.extend(copy(self.feedbacks))
 
     def send_packet(self, path: GeneralSenderPath, packet: RLNCPacket):
         # self.update_information_packets_first_transmission_times(packet)
@@ -472,8 +472,8 @@ class SimSender(GeneralSender):
         super().get_feedbacks_from_all_paths()
         acks = [ack for ack in self.feedbacks if ack.is_ack()]
         nacks = [nack for nack in self.feedbacks if nack.is_nack()]
-        self.acked_feedback_history.extend(deepcopy(acks))
-        self.nacked_feedback_history.extend(deepcopy(nacks))
+        self.acked_feedback_history.extend(copy(acks))
+        self.nacked_feedback_history.extend(copy(nacks))
 
     def update_sim_sender_params(self):
         self.update_rlnc_id_depended_on_undecoded_information_packets()
