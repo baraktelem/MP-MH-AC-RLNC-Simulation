@@ -179,7 +179,7 @@ class SRSender(GeneralSender):
         return s
 
 
-class IndependentSRSender(SRSender):
+class SRSimSender(SRSender):
     """Per-path-independent SR ARQ source (the paper's baseline).
 
     Unlike SRSender (one shared stream striped+rerouted across paths), here each
@@ -196,6 +196,10 @@ class IndependentSRSender(SRSender):
         # Per-path next new seq (round-robin slice) and per-path retransmit set.
         self.path_next_new_seq: dict[int, int] = {i: i + 1 for i in range(P)}
         self.path_retransmit: dict[int, set[int]] = {i: set() for i in range(P)}
+        # Per-path sliding-window base: lowest not-yet-ACKed seq owned by path i.
+        # Path i's slice strides by P, so the base advances by P. Same range-based
+        # window as SRSender, applied independently per path/chain.
+        self.path_send_base: dict[int, int] = {i: i + 1 for i in range(P)}
         self.gid_to_index: dict[int, int] = {
             p.get_global_path_index(): i for i, p in enumerate(self.paths)
         }
@@ -209,6 +213,10 @@ class IndependentSRSender(SRSender):
                     self.acked_seqs.add(seq)
                     if i is not None:
                         self.path_retransmit[i].discard(seq)
+        # Advance each path's window base past its contiguously-ACKed seqs (stride P).
+        for i in range(self.num_of_paths):
+            while self.path_send_base[i] in self.acked_seqs:
+                self.path_send_base[i] += self.num_of_paths
         # NACKs: resolve slot -> seq and re-queue on the SAME path (no rerouting).
         for fb in self.feedbacks:
             if fb.is_nack():
@@ -236,14 +244,21 @@ class IndependentSRSender(SRSender):
             seq = min(self.path_retransmit[i])
             self.path_retransmit[i].discard(seq)
             return seq
+        # New seq only if within this path's window: at most `window` outstanding
+        # packets, i.e. (next_new - send_base)/P < window (P = stride).
         if self.path_next_new_seq[i] <= self.num_of_packets_to_send:
-            seq = self.path_next_new_seq[i]
-            self.path_next_new_seq[i] += self.num_of_paths
-            return seq
+            within_window = (
+                self.window is None
+                or (self.path_next_new_seq[i] - self.path_send_base[i]) < self.window * self.num_of_paths
+            )
+            if within_window:
+                seq = self.path_next_new_seq[i]
+                self.path_next_new_seq[i] += self.num_of_paths
+                return seq
         return None
 
     def __repr__(self) -> str:
-        s = "IndependentSRSender:"
+        s = "SRSimSender:"
         s += f"\n  num_of_packets_to_send: {self.num_of_packets_to_send}"
         s += f"\n  num paths: {self.num_of_paths}"
         s += f"\n  per-path next new seq: {self.path_next_new_seq}"

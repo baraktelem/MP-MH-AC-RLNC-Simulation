@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "sr_arq"))
 
 from mp_mh_network.Network import MPNetwork, SimulationStats
-from sr_arq.SRNetwork import SRNetwork
+from sr_arq.SRNetwork import SRNetwork, SRMpMhNetwork
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,39 @@ from sr_arq.SRNetwork import SRNetwork
 
 def _path_epsilons(e1: float, e2: float, e3: float, e4: float) -> list[float]:
     return [float(e1), float(e2), float(e3), float(e4)]
+
+
+def _mpmh_epsilons(e1: float, e2: float, e3: float, e4: float, num_hops: int) -> list[list[float]]:
+    """Chain-major eps matrix [chain][hop]: each of the 4 chains keeps its own
+    erasure across all its hops (uniform-per-chain multi-hop extension of the
+    single-hop [e1, e2, e3, e4] setting)."""
+    return [[float(e)] * num_hops for e in (e1, e2, e3, e4)]
+
+
+def run_sr_mpmh(
+    *,
+    path_eps: list[float],
+    num_paths: int,
+    num_hops: int,
+    rtt: int,
+    num_packets_to_send: int,
+    max_iterations: int | None,
+    window: int | None = None,
+) -> SimulationStats:
+    """Multi-hop decoupled per-chain SR-ARQ via a single SRMpMhNetwork (P chains
+    of H hops with hop-by-hop SRNodes). At H=1 this reduces to the single-hop
+    decoupled per-path model."""
+    net = SRMpMhNetwork(
+        path_epsilons=_mpmh_epsilons(*path_eps, num_hops),
+        max_iterations=max_iterations,
+        num_packets_to_send=num_packets_to_send,
+        num_paths=num_paths,
+        prop_delay=rtt // 2,
+        num_hops=num_hops,
+        window=window,
+    )
+    net.run_sim()
+    return net.get_simulation_stats()
 
 
 def run_sr(
@@ -169,7 +202,7 @@ def run_ac_rlnc(
 
 def _run_one_task(args: tuple) -> tuple:
     (proto, e1, e2, e3, e4, it, num_paths, rtt, threshold, o_bar,
-     num_packets_to_send, max_iterations, sr_window) = args
+     num_packets_to_send, max_iterations, sr_window, num_hops) = args
     path_eps = _path_epsilons(e1, e2, e3, e4)
     if proto in ("sr", "sr_indep"):
         stats = run_sr(
@@ -184,6 +217,16 @@ def _run_one_task(args: tuple) -> tuple:
         stats = run_sr_independent_perpath(
             path_eps=path_eps,
             num_paths=num_paths,
+            rtt=rtt,
+            num_packets_to_send=num_packets_to_send,
+            max_iterations=max_iterations,
+            window=sr_window,
+        )
+    elif proto == "sr_mpmh":
+        stats = run_sr_mpmh(
+            path_eps=path_eps,
+            num_paths=num_paths,
+            num_hops=num_hops,
             rtt=rtt,
             num_packets_to_send=num_packets_to_send,
             max_iterations=max_iterations,
@@ -288,7 +331,12 @@ def plot_compare(
         ax.set_zlabel(label)
         ax.set_zlim(0, max(0.1, max_z * 1.1))
         ax.set_title(label)
-        ax.view_init(elev=20, azim=45)
+        # Default paper-style orientation: eps_1 on the left, eps_2 on the
+        # right, and the Z axis on the right. Both epsilon scales increase
+        # visually from right to left.
+        ax.view_init(elev=10, azim=-45)
+        ax.invert_xaxis()
+        ax.invert_yaxis()
         ax.legend(handles=legend, fontsize=8, loc="upper left")
 
     fig.suptitle(title_suffix, fontsize=13, fontweight="bold")
@@ -335,6 +383,8 @@ def _run_main() -> None:
     NUM_ITERATIONS = 150
     MAX_ITERATIONS = 20000
     RUN_AC_RLNC = False
+    # Number of hops for the multi-hop protocol (sr_mpmh). H=1 == single-hop.
+    NUM_HOPS = 3
     # Per-path sliding-window size for the sr_perpath (decoupled) SR-ARQ. None =
     # unbounded (sender front-loads, throughput approaches capacity). A finite w
     # (e.g. RTT-1) throttles throughput below the link rate, like real SR-ARQ.
@@ -349,14 +399,17 @@ def _run_main() -> None:
     print(f"  P={NUM_PATHS}, RTT={RTT}, eps_3={EPS3}, eps_4={EPS4}")
     print(f"  eps_1, eps_2 grid: {EPS_VALUES}")
     print(f"  packets/run={NUM_PACKETS_TO_SEND}, iterations={NUM_ITERATIONS}, "
-          f"compare_ac_rlnc={RUN_AC_RLNC}, sr_window={SR_WINDOW}, workers={PARALLEL_WORKERS}")
+          f"compare_ac_rlnc={RUN_AC_RLNC}, sr_window={SR_WINDOW}, num_hops={NUM_HOPS}, "
+          f"workers={PARALLEL_WORKERS}")
 
     if LOAD_EXISTING and os.path.exists(RESULTS_FILE):
         bundle = load_pickle(RESULTS_FILE)
         results_by_proto = bundle
     else:
-        # protos = ["sr", "sr_indep", "sr_perpath"] + (["ac"] if RUN_AC_RLNC else [])
-        protos = ["sr_perpath"]
+        # Available protos: "sr" (shared), "sr_indep" (coupled round-robin),
+        # "sr_perpath" (decoupled single-hop), "sr_mpmh" (decoupled multi-hop),
+        # "ac" (MP AC-RLNC). Pick whichever you want to run/compare.
+        protos = ["sr_mpmh"]
         tasks: list[tuple] = []
         for proto in protos:
             for it in range(1, NUM_ITERATIONS + 1):
@@ -365,7 +418,7 @@ def _run_main() -> None:
                         tasks.append((
                             proto, e1, e2, EPS3, EPS4, it, NUM_PATHS, RTT,
                             THRESHOLD, O_BAR, NUM_PACKETS_TO_SEND, MAX_ITERATIONS,
-                            SR_WINDOW,
+                            SR_WINDOW, NUM_HOPS,
                         ))
 
         results_by_proto: dict[str, list[tuple[float, float, SimulationStats]]] = {
@@ -384,13 +437,18 @@ def _run_main() -> None:
     # (green), decoupled per-path SR = paper's SP:SR-ARQ baseline (red, with std
     # bars), MP AC-RLNC (orange) if present.
     PERPATH_LABEL = "SP SR-ARQ (per-path independent)"
+    MPMH_LABEL = f"SR-ARQ multi-hop (H={NUM_HOPS}, hop-by-hop)"
     series = []
+    std_label = PERPATH_LABEL
     if results_by_proto.get("sr"):
         series.append(("SR ARQ (shared multipath)", aggregate(results_by_proto["sr"]), "tab:blue"))
     if results_by_proto.get("sr_indep"):
         series.append(("SR ARQ (coupled round-robin)", aggregate(results_by_proto["sr_indep"]), "tab:green"))
     if results_by_proto.get("sr_perpath"):
         series.append((PERPATH_LABEL, aggregate(results_by_proto["sr_perpath"]), "tab:red"))
+    if results_by_proto.get("sr_mpmh"):
+        series.append((MPMH_LABEL, aggregate(results_by_proto["sr_mpmh"]), "tab:purple"))
+        std_label = MPMH_LABEL
     if results_by_proto.get("ac"):
         series.append(("MP AC-RLNC", aggregate(results_by_proto["ac"]), "tab:orange"))
 
@@ -399,11 +457,11 @@ def _run_main() -> None:
         EPS_VALUES,
         EPS_VALUES,
         title_suffix=(
-            f"MP sanity check (H=1, P={NUM_PATHS}, RTT={RTT}, eps_3={EPS3}, eps_4={EPS4}); "
-            f"SR ARQ (shared / coupled / per-path) vs MP AC-RLNC; {NUM_ITERATIONS} realizations"
+            f"SR-ARQ MP/MP-MH (P={NUM_PATHS}, RTT={RTT}, eps_3={EPS3}, eps_4={EPS4}); "
+            f"{NUM_ITERATIONS} realizations"
         ),
         plot_path=PLOT_FILE,
-        std_for=PERPATH_LABEL,
+        std_for=std_label,
     )
     print("\nDone.")
 
