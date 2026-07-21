@@ -93,6 +93,7 @@ class SRNodeSender(SRSender):
         output_path: Path,
         node_receiver: SRNodeReceiver,
         rtt: int,
+        num_chains: int = 1,
         unit_name: str = None,
         window: int = None,
         debug: bool = False,
@@ -110,15 +111,30 @@ class SRNodeSender(SRSender):
         self.unit_name = unit_name if unit_name is not None else "SRNodeSender"
         self.node_receiver = node_receiver
         self.forwarded: set[int] = set()  # seqs sent downstream at least once
+        # This relay owns one round-robin slice of the global sequence space:
+        # chain gid owns gid, gid+P, gid+2P, ... .  The inherited source sender
+        # uses stride 1, so replace its base with this chain's first sequence.
+        self.send_stride = num_chains
+        self.send_base = output_path.get_global_path_index()
+
+    def _advance_send_base(self):
+        """Advance the relay window along this chain's strided sequence space."""
+        while self.send_base in self.acked_seqs:
+            self.send_base += self.send_stride
 
     def _next_seq_to_send(self) -> int | None:
         # Downstream-NACKed seqs first (lowest), then the lowest received-but-not-
-        # yet-forwarded seq (out-of-order forwarding: gaps are skipped).
+        # yet-forwarded seq inside this chain's sliding window.  Retransmissions
+        # remain eligible when the window is full because they do not add a new
+        # outstanding sequence.
         if self.retransmit_queue:
             seq = min(self.retransmit_queue)
             self.retransmit_queue.discard(seq)
             return seq
         pending = self.node_receiver.received_seqs - self.forwarded
+        if self.window is not None:
+            window_end = self.send_base + self.window * self.send_stride
+            pending = {seq for seq in pending if seq < window_end}
         if pending:
             seq = min(pending)
             self.forwarded.add(seq)
@@ -173,6 +189,7 @@ class SRNode:
             output_path=output_path,
             node_receiver=self.my_receiver,
             rtt=rtt,
+            num_chains=num_chains,
             unit_name=f"{self.unit_name}.Sender",
             window=window,
             debug=debug,

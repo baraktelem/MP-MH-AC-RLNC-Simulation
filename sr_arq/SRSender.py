@@ -108,8 +108,7 @@ class SRSender(GeneralSender):
                     self.acked_seqs.add(seq)
                     self.retransmit_queue.discard(seq)
         # Advance the window base past all contiguously-ACKed seqs.
-        while self.send_base in self.acked_seqs:
-            self.send_base += 1
+        self._advance_send_base()
         # Then NACKs: resolve slot -> seq and re-queue if not already delivered.
         for fb in self.feedbacks:
             if fb.is_nack():
@@ -121,6 +120,11 @@ class SRSender(GeneralSender):
                 if seq is not None and seq not in self.acked_seqs:
                     self.retransmit_queue.add(seq)
                     self.sim_print(f"NACK -> re-queue seq {seq} (slot {creation_time}, path {path.get_global_path_index()})")
+
+    def _advance_send_base(self):
+        """Advance past the contiguous ACKed prefix of this sender's stream."""
+        while self.send_base in self.acked_seqs:
+            self.send_base += 1
 
     def _transmit(self):
         for path in self.paths:
