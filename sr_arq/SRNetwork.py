@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
@@ -96,10 +97,20 @@ class SRMpMhNetwork(Network):
       - One SRNode per (chain, hop) doing hop-by-hop store-and-forward ARQ.
       - Receiver = SRSimReceiver with DECOUPLED per-chain in-order delivery.
 
-    Metrics are decoupled per chain: throughput is the SUM of per-chain rates
-    (delivered_c / finish_time_c), while D_mean/D_max are over all packets
-    (delivery time - source first-transmission time), reusing Network's delay
-    pipeline. H=1 reduces to the single-hop decoupled per-path model.
+    With a finite packet target, the simulation stops when all target packets are
+    delivered (or max_iterations is reached).  With an infinite packet target
+    and finite max_iterations, max_iterations is a fixed measurement horizon:
+    throughput is snapshotted at that horizon, source admission is then closed,
+    and already-admitted packets are drained before delay statistics are taken.
+
+    packets_per_path (optional): equal new-packet quota per chain. When set,
+    each chain admits at most that many new seqs and the global delivery target
+    becomes packets_per_path * num_paths. Retransmits are unaffected. Works
+    independently of max_iterations (either or both may be set).
+
+    Throughput is total in-order delivery over the common measurement interval.
+    D_mean/D_max are delivery time minus source first-transmission time over the
+    completed packet cohort. H=1 reduces to the single-hop decoupled model.
 
     path_epsilons is chain-major: path_epsilons[c][h].
     """
@@ -117,8 +128,15 @@ class SRMpMhNetwork(Network):
         num_hops: int = 3,
         window: int = None,
         in_order_forwarding: bool = False,
+        packets_per_path: int = None,
         debug: bool = False,
     ):
+        # Equal per-path quota implies a global delivery target of P * N.
+        if packets_per_path is not None:
+            assert packets_per_path > 0, (
+                f"packets_per_path must be > 0, got {packets_per_path}"
+            )
+            num_packets_to_send = packets_per_path * num_paths
         super().__init__(
             path_epsilons,
             initial_epsilon,
@@ -130,6 +148,7 @@ class SRMpMhNetwork(Network):
             max_allowed_overlap,
             debug,
         )
+        self.packets_per_path = packets_per_path
         assert num_hops >= 1, f"num_hops must be >= 1, got {num_hops}"
         assert len(path_epsilons) == num_paths, (
             f"path_epsilons must be chain-major with num_paths ({num_paths}) rows, got {len(path_epsilons)}"
@@ -184,6 +203,7 @@ class SRMpMhNetwork(Network):
             paths=[self.paths[c][0] for c in range(num_paths)],
             initial_epsilon=init_eps,
             window=window,
+            packets_per_path=packets_per_path,
             next_hop=None,
             debug=self.debug,
         )
@@ -208,7 +228,7 @@ class SRMpMhNetwork(Network):
                 self.t += 1
                 self._tick()
         self.collect_stats()
-        print(f"Simulation completed at t={self.t}")
+        # print(f"Simulation completed at t={self.t}")
 
     def calculate_normalized_throughput_stats(self):
         # Decoupled: sum of per-chain rates (delivered_c / chain_finish_time_c),

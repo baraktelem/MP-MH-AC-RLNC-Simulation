@@ -578,16 +578,20 @@ if __name__ == "__main__":
             title_suffix=f"{label} (1 surface per k)",
             plot_path=f"{plot_stem}.png",
         )
-    elif len(flat_datasets) == 1:
-        # Single dataset - use original plotting function
-        print("Single protocol - using standard plot")
-        plot_stats(flat_datasets[0][1])
-    else:
-        # Multiple flat / multi-series datasets - SR-style overlay comparison
-        print(f"Comparing {len(flat_datasets)} protocols/series")
+    elif len(flat_datasets) >= 1:
+        # One or more flat / multi-series datasets - SR-style view
+        # (eps1 left, eps2 right, Z right; both eps increase toward the back).
+        # Always use plot_compare — even for a single series — so single-key
+        # pickles like sr_arq_mp_results.pkl don't fall back to plot_stats'
+        # old azim=45 orientation.
+        n = len(flat_datasets)
+        print(
+            f"{'Single protocol' if n == 1 else f'Comparing {n} protocols/series'}"
+            " - using SR-style plot"
+        )
         colors = [
-            "tab:red", "tab:blue", "tab:green", "tab:orange",
-            "tab:purple", "tab:brown", "tab:pink", "tab:gray",
+            "tab:purple", "tab:red", "tab:blue", "tab:green",
+            "tab:orange", "tab:brown", "tab:pink", "tab:gray",
         ]
         series = []
         eps1_vals: set[float] = set()

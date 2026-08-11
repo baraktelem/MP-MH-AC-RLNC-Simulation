@@ -331,9 +331,6 @@ def plot_compare(
         ax.set_zlabel(label)
         ax.set_zlim(0, max(0.1, max_z * 1.1))
         ax.set_title(label)
-        # Default paper-style orientation: eps_1 on the left, eps_2 on the
-        # right, and the Z axis on the right. Both epsilon scales increase
-        # visually from right to left.
         ax.view_init(elev=10, azim=-45)
         ax.invert_xaxis()
         ax.invert_yaxis()
@@ -384,7 +381,7 @@ def _run_main() -> None:
     MAX_ITERATIONS = 20000
     RUN_AC_RLNC = False
     # Number of hops for the multi-hop protocol (sr_mpmh). H=1 == single-hop.
-    NUM_HOPS = 3
+    NUM_HOPS = 1
     # Per-path sliding-window size for the sr_perpath (decoupled) SR-ARQ. None =
     # unbounded (sender front-loads, throughput approaches capacity). A finite w
     # (e.g. RTT-1) throttles throughput below the link rate, like real SR-ARQ.

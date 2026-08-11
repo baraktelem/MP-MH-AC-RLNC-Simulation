@@ -194,9 +194,17 @@ class SRSimSender(SRSender):
     reorders globally (same SRReceiver), so the metrics are comparable.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, packets_per_path: int | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         P = self.num_of_paths
+        # Equal per-path new-packet quota (None = unlimited). Caps admission of
+        # new seqs only; retransmits are unaffected.
+        if packets_per_path is not None:
+            assert packets_per_path > 0, (
+                f"packets_per_path must be > 0, got {packets_per_path}"
+            )
+        self.packets_per_path: int | None = packets_per_path
+        self.path_admitted_count: dict[int, int] = {i: 0 for i in range(P)}
         # Per-path next new seq (round-robin slice) and per-path retransmit set.
         self.path_next_new_seq: dict[int, int] = {i: i + 1 for i in range(P)}
         self.path_retransmit: dict[int, set[int]] = {i: set() for i in range(P)}
@@ -248,6 +256,13 @@ class SRSimSender(SRSender):
             seq = min(self.path_retransmit[i])
             self.path_retransmit[i].discard(seq)
             return seq
+        # Equal per-path quota: stop admitting new seqs once this chain has
+        # used its allowance (retransmits above still allowed).
+        if (
+            self.packets_per_path is not None
+            and self.path_admitted_count[i] >= self.packets_per_path
+        ):
+            return None
         # New seq only if within this path's window: at most `window` outstanding
         # packets, i.e. (next_new - send_base)/P < window (P = stride).
         if self.path_next_new_seq[i] <= self.num_of_packets_to_send:
@@ -258,13 +273,16 @@ class SRSimSender(SRSender):
             if within_window:
                 seq = self.path_next_new_seq[i]
                 self.path_next_new_seq[i] += self.num_of_paths
+                self.path_admitted_count[i] += 1
                 return seq
         return None
 
     def __repr__(self) -> str:
         s = "SRSimSender:"
         s += f"\n  num_of_packets_to_send: {self.num_of_packets_to_send}"
+        s += f"\n  packets_per_path: {self.packets_per_path}"
         s += f"\n  num paths: {self.num_of_paths}"
+        s += f"\n  per-path admitted: {self.path_admitted_count}"
         s += f"\n  per-path next new seq: {self.path_next_new_seq}"
         s += f"\n  per-path retransmit sizes: {[len(self.path_retransmit[i]) for i in range(self.num_of_paths)]}"
         s += f"\n  total transmissions: {len(self.sent_new_rlnc_history)}"

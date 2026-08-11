@@ -88,10 +88,11 @@ def _run_srmpmh(
     matrix: list[list[float]],
     num_paths: int,
     rtt: int,
-    num_packets_to_send: int,
+    num_packets_to_send: int | None,
     max_iterations: int | None,
     window: int | None,
     in_order_forwarding: bool = False,
+    packets_per_path: int | None = None,
 ) -> SimulationStats:
     net = SRMpMhNetwork(
         path_epsilons=matrix,
@@ -102,25 +103,34 @@ def _run_srmpmh(
         max_iterations=max_iterations,
         window=window,
         in_order_forwarding=in_order_forwarding,
+        packets_per_path=packets_per_path,
     )
     net.run_sim()
     return net.get_simulation_stats()
 
 
 def run_best_single(
-    e1: float, e2: float, *, rtt: int, num_packets_to_send: int,
+    e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
+    packets_per_path: int | None = None,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
-    return _run_srmpmh(best_single_path(E), 1, rtt, num_packets_to_send, max_iterations, window, in_order_forwarding)
+    return _run_srmpmh(
+        best_single_path(E), 1, rtt, num_packets_to_send, max_iterations, window,
+        in_order_forwarding, packets_per_path=packets_per_path,
+    )
 
 
 def run_matched(
-    e1: float, e2: float, *, rtt: int, num_packets_to_send: int,
+    e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
+    packets_per_path: int | None = None,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
-    return _run_srmpmh(natural_matched(E), NUM_PATHS, rtt, num_packets_to_send, max_iterations, window, in_order_forwarding)
+    return _run_srmpmh(
+        natural_matched(E), NUM_PATHS, rtt, num_packets_to_send, max_iterations, window,
+        in_order_forwarding, packets_per_path=packets_per_path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,16 +138,21 @@ def run_matched(
 # ---------------------------------------------------------------------------
 
 def _run_one(args: tuple) -> tuple:
-    (setting, e1, e2, rtt, num_packets_to_send, max_iterations, window, in_order_forwarding) = args
+    (setting, e1, e2, rtt, num_packets_to_send, max_iterations, window,
+     in_order_forwarding, packets_per_path) = args
     if setting == "best":
         stats = run_best_single(
             e1, e2, rtt=rtt, num_packets_to_send=num_packets_to_send,
-            max_iterations=max_iterations, window=window, in_order_forwarding=in_order_forwarding,
+            max_iterations=max_iterations, window=window,
+            in_order_forwarding=in_order_forwarding,
+            packets_per_path=packets_per_path,
         )
     else:
         stats = run_matched(
             e1, e2, rtt=rtt, num_packets_to_send=num_packets_to_send,
-            max_iterations=max_iterations, window=window, in_order_forwarding=in_order_forwarding,
+            max_iterations=max_iterations, window=window,
+            in_order_forwarding=in_order_forwarding,
+            packets_per_path=packets_per_path,
         )
     return (setting, float(e1), float(e2), stats)
 
@@ -167,30 +182,42 @@ def _run_main() -> None:
     print("=" * 70)
 
     # ---- Paper MP-MH setting ---------------------------------------------
-    RTT_LOCAL = RTT                                   # 12
-    SR_WINDOW = RTT_LOCAL - 1                          # per-chain sliding window
+    RTT_LOCAL = RTT / NUM_HOPS                                   
+    # SR_WINDOW = RTT_LOCAL - 1                          # per-chain sliding window
+    SR_WINDOW  = 2 * (RTT_LOCAL - 1)
     EPS_VALUES = [round(float(v), 2) for v in np.arange(0.1, 0.9, 0.1)]  # eps1, eps2 in [0.1, 0.8]
 
-    NUM_PACKETS_TO_SEND = 500
     NUM_ITERATIONS = 150
-    MAX_ITERATIONS = 40000
+    # Equal new-packet quota per chain (None = unlimited). When set, each chain
+    # admits exactly this many new seqs; global delivery target becomes P * N
+    # (or 1 * N for the best single-path setting).
+    PACKETS_PER_PATH = 1000
+    # Legacy global packet target; ignored when PACKETS_PER_PATH is set.
+    NUM_PACKETS_TO_SEND = None
+    # Optional hard time stop (None = run until all quota packets are delivered).
+    MAX_ITERATIONS = None
+
     # Node forwarding discipline: False = out-of-order relay (efficient, low delay);
     # True = full SR-ARQ at each node (in-order forwarding, per-hop HOL blocking,
     # higher delay - matches the paper's "full SR-ARQ protocol at each node").
-    IN_ORDER_FORWARDING = True
+    IN_ORDER_FORWARDING = False
     PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
     LOAD_EXISTING = False
-    RESULTS_FILE = "sr_arq_mpmh_results.pkl"
-    PLOT_FILE = "sr_arq_mpmh_compare.png"
+    # Keep the complete-cohort (post-horizon drain) experiment separate from
+    # the earlier hard-cutoff results, whose delays were right-censored.
+    RESULTS_FILE = f"sr_arq_mpmh_results_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT_LOCAL}.pkl"
+    PLOT_FILE = f"sr_arq_mpmh_compare_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT_LOCAL}.png"
 
     SETTINGS = ["best", "matched"]
 
     print("\nParameters:")
     print(f"  P={NUM_PATHS}, H={NUM_HOPS}, RTT={RTT_LOCAL}, window={SR_WINDOW}")
     print(f"  eps1, eps2 grid: {EPS_VALUES}")
-    print(f"  packets/run={NUM_PACKETS_TO_SEND}, iterations={NUM_ITERATIONS}, "
-          f"in_order_forwarding={IN_ORDER_FORWARDING}, workers={PARALLEL_WORKERS}")
+    print(f"  packets_per_path={PACKETS_PER_PATH}, max_iterations={MAX_ITERATIONS}")
+    print(f"  num_packets_to_send={NUM_PACKETS_TO_SEND} (legacy; unused if packets_per_path set)")
+    print(f"  iterations={NUM_ITERATIONS}, in_order_forwarding={IN_ORDER_FORWARDING}, "
+          f"workers={PARALLEL_WORKERS}")
 
     if LOAD_EXISTING and os.path.exists(RESULTS_FILE):
         results_by_setting = load_pickle(RESULTS_FILE)
@@ -203,6 +230,7 @@ def _run_main() -> None:
                         tasks.append((
                             setting, e1, e2, RTT_LOCAL, NUM_PACKETS_TO_SEND,
                             MAX_ITERATIONS, SR_WINDOW, IN_ORDER_FORWARDING,
+                            PACKETS_PER_PATH,
                         ))
 
         results_by_setting: dict[str, list[tuple[float, float, SimulationStats]]] = {
@@ -217,21 +245,30 @@ def _run_main() -> None:
 
         save_pickle(results_by_setting, RESULTS_FILE)
 
-    BEST_LABEL = "SR-ARQ best single path"
-    MATCHED_LABEL = "SR-ARQ P matched paths"
+    BEST_LABEL = "SR-ARQ only the best path per hop"
+    MATCHED_LABEL = "SR-ARQ all paths with natural matching"
     series = []
     if results_by_setting.get("best"):
         series.append((BEST_LABEL, aggregate(results_by_setting["best"]), "tab:red"))
     if results_by_setting.get("matched"):
         series.append((MATCHED_LABEL, aggregate(results_by_setting["matched"]), "tab:blue"))
 
+    horizon_label = (
+        f"horizon={MAX_ITERATIONS}" if MAX_ITERATIONS is not None else "no horizon"
+    )
+    quota_label = (
+        f"packets/path={PACKETS_PER_PATH}"
+        if PACKETS_PER_PATH is not None
+        else f"packets={NUM_PACKETS_TO_SEND}"
+    )
     plot_compare(
         series,
         EPS_VALUES,
         EPS_VALUES,
         title_suffix=(
             f"SR-ARQ MP-MH hop-by-hop (paper Fig. 19 lower); "
-            f"H={NUM_HOPS}, P={NUM_PATHS}, RTT={RTT_LOCAL}; {NUM_ITERATIONS} realizations"
+            f"H={NUM_HOPS}, P={NUM_PATHS}, RTT={RTT_LOCAL}, W={SR_WINDOW}; "
+            f"{quota_label}, {horizon_label}; {NUM_ITERATIONS} realizations"
         ),
         plot_path=PLOT_FILE,
         std_for=MATCHED_LABEL,
