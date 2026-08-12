@@ -59,7 +59,7 @@ class ReceiverPath(Path):
 class GeneralReceiver:
     def __init__(self,
                 input_paths: list[Path],
-                rtt: int,
+                hop_rtt: int,
                 unit_name: str=None,
                 debug: bool = False):
         self.unit_name = unit_name if unit_name is not None else "GeneralReceiver"
@@ -68,12 +68,12 @@ class GeneralReceiver:
         # Receiver paths
         self.receiver_paths = [ReceiverPath(path, i, self) for i, path in enumerate(input_paths)]
         self.num_of_input_paths = len(input_paths)
-        self.paths_propagation_time = rtt / 2 # Propagation time is half of the RTT
+        self.paths_propagation_time = hop_rtt / 2 # Per-hop one-way delay is half of the per-hop RTT
         assert len([path for path in input_paths if path.get_propagation_delay() != self.paths_propagation_time]) == 0, \
             "All paths must have the same propagation time"
 
         # Parameters
-        self.rtt = rtt
+        self.hop_rtt = hop_rtt
         self.t = 0 # Current time step
 
         # Forward arrival from the input path served this step (round-robin); None if that path had nothing
@@ -180,13 +180,13 @@ class GeneralReceiver:
 class SimReceiver(GeneralReceiver):
     def __init__(self,
                 input_paths: list[Path],
-                rtt: int,
+                hop_rtt: int,
                 unit_name: str=None,
                 debug: bool = False):
         # Set unit name before calling super() for setting name that is not "GeneralReceiver"
         if unit_name is None:
             unit_name = "SimReceiver"
-        super().__init__(input_paths, rtt, unit_name, debug=debug)
+        super().__init__(input_paths, hop_rtt, unit_name, debug=debug)
 
         # Decoding
         self.coded_equations : list[CodedEquation] = [] # All undecoded equations
@@ -243,7 +243,7 @@ class NodeReceiver(GeneralReceiver):
         self,
         hop_num: int,
         input_paths: list[Path],
-        rtt: int,
+        hop_rtt: int,
         unit_name: str=None,
         parent_node: 'Node'=None,
         debug: bool = False,
@@ -251,7 +251,7 @@ class NodeReceiver(GeneralReceiver):
         # Constants
         if unit_name is None:   # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeReceiver[{hop_num}]"
-        super().__init__(input_paths, rtt, unit_name, debug=debug)
+        super().__init__(input_paths, hop_rtt, unit_name, debug=debug)
         self.hop_num = hop_num
 
         # Network

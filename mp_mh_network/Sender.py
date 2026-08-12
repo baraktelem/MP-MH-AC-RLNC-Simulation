@@ -120,7 +120,7 @@ class SimSenderPath(GeneralSenderPath):
 class GeneralSender:
     def __init__(
         self,
-        rtt: int,
+        hop_rtt: int,
         paths: list[Path],
         init_paths: bool = False, # Default is False for SimSender
         initial_epsilon: float = 0.0,
@@ -130,7 +130,7 @@ class GeneralSender:
         self.debug = debug
 
         # Constants
-        self.rtt = rtt
+        self.hop_rtt = hop_rtt  # per-hop RTT (used by node senders; SimSender uses self.global_rtt)
         self.initial_epsilon = initial_epsilon
         if init_paths:
             self.paths : list[GeneralSenderPath] = [GeneralSenderPath(path, self, i, initial_epsilon) for i, path in enumerate(paths)]
@@ -199,7 +199,8 @@ class SimSender(GeneralSender):
     def __init__(
         self,
         num_of_packets_to_send: int,
-        rtt: int,
+        global_rtt: int,
+        hop_rtt: int,
         paths: list[Path],
         initial_epsilon: float = 0.0,
         max_allowed_overlap: int = None,
@@ -208,9 +209,10 @@ class SimSender(GeneralSender):
         next_hop : 'SimReceiver | Node' = None,
         debug: bool = False,
         ):
-        super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
+        super().__init__(hop_rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
         # Sender constants
         self.unit_name = "SimSender"
+        self.global_rtt = global_rtt  # end-to-end RTT drives the a-priori window / overlap
         self.num_of_packets_to_send = num_of_packets_to_send
         self.paths = [SimSenderPath(path, self, i, initial_epsilon) for i, path in enumerate(paths)]
         self.num_of_paths = len(self.paths)
@@ -243,9 +245,9 @@ class SimSender(GeneralSender):
         self.delta = self.num_of_paths * ( self.d - 1 - self.threshold)
 
         # FEC parameters
-        self.EW = len(self.paths) * (rtt - 1) # End window of k=P*(RTT-1) new packets 
+        self.EW = len(self.paths) * (self.global_rtt - 1) # End window of k=P*(RTT-1) new packets 
         self.max_overlap_flag = False # Flag to indicate if max overlap has been reached
-        self.max_allowed_overlap = max_allowed_overlap if max_allowed_overlap is not None else 2 * rtt # Denoted as o_bar in the paper
+        self.max_allowed_overlap = max_allowed_overlap if max_allowed_overlap is not None else 2 * self.global_rtt # Denoted as o_bar in the paper
         # self.feedbacks : list[FeedbackPacket] = [] # Feedback packets from all paths at current time
         self.oldest_information_packet_on_air = 1 # Last information packet sent- for max overlap
         self.newest_information_packet_on_air = 0 # Newest information packet sent- for max overlap
@@ -368,9 +370,9 @@ class SimSender(GeneralSender):
     
     def init_fec_transmissions(self):
         if self.is_EW():
-            # set mp for all paths after k = num_of_paths * (rtt - 1) transmissions
+            # set mp for all paths after k = num_of_paths * (global_rtt - 1) transmissions
             for path in self.paths:
-                path.mp = round(path.epsilon_est * (self.rtt - 1)) # Round to nearest integer
+                path.mp = round(path.epsilon_est * (self.global_rtt - 1)) # Round to nearest integer
             # start FEC for all remaining paths
             paths_for_init_fec = list(self.remaining_paths_for_transmission)  # Copy the list
             for path in paths_for_init_fec:
@@ -659,7 +661,8 @@ class SimSender(GeneralSender):
     def __repr__(self):
         s = "SimSender:"
         s += f"\n  num_of_packets_to_send: {self.num_of_packets_to_send}"
-        s += f"\n  rtt: {self.rtt}"
+        s += f"\n  global_rtt: {self.global_rtt}"
+        s += f"\n  hop_rtt: {self.hop_rtt}"
         s += f"\n  num paths: {self.num_of_paths}"
         s += f"\n  initial epsilon: {self.initial_epsilon}"
         s += f"\n  my receiver: {self.unit_name}"
@@ -673,7 +676,7 @@ class SimSender(GeneralSender):
 class NodeSender(GeneralSender):
     def __init__(
         self,
-        rtt: int,
+        hop_rtt: int,
         hop_num: int,
         paths: list[Path],
         initial_epsilon: float = 0.0,
@@ -685,7 +688,7 @@ class NodeSender(GeneralSender):
         if unit_name is None: # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeSender[{hop_num}]"
         self.unit_name = unit_name
-        super().__init__(rtt, paths, init_paths=True, initial_epsilon=initial_epsilon, debug=debug)
+        super().__init__(hop_rtt, paths, init_paths=True, initial_epsilon=initial_epsilon, debug=debug)
         self.hop_num = hop_num
 
         # Network

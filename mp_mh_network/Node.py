@@ -9,7 +9,7 @@ class Node:
                  hop_num: int,
                  input_paths: list[Path],
                  output_paths: list[Path],
-                 rtt: int,
+                 hop_rtt: int,
                  unit_name: str=None,
                  next_hop: 'Node | SimReceiver'=None,
                  Network: 'MpMhNetwork'=None,
@@ -20,7 +20,7 @@ class Node:
         # Constants
         self.hop_num = hop_num
         self.unit_name = unit_name if unit_name is not None else f"Node[{hop_num}]"
-        self.rtt = rtt
+        self.hop_rtt = hop_rtt
         self.input_paths = input_paths
         self.output_paths = output_paths
 
@@ -29,8 +29,8 @@ class Node:
         self.next_hop = next_hop
 
         # Node units
-        self.my_receiver = NodeReceiver(hop_num=hop_num, input_paths=input_paths, rtt=rtt, unit_name=unit_name, parent_node=self, debug=debug)
-        self.my_sender = NodeSender(rtt=rtt, hop_num=hop_num, paths=output_paths, unit_name=unit_name, parent_node=self, debug=debug)
+        self.my_receiver = NodeReceiver(hop_num=hop_num, input_paths=input_paths, hop_rtt=hop_rtt, unit_name=unit_name, parent_node=self, debug=debug)
+        self.my_sender = NodeSender(hop_rtt=hop_rtt, hop_num=hop_num, paths=output_paths, unit_name=unit_name, parent_node=self, debug=debug)
 
         # Natural Matching Tracking
         self.global_paths_rlnc_types : dict[int, NodeRLNCType | RLNCType] = {} # Mapping for each global path index to the RLNC type received on that path

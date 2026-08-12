@@ -45,14 +45,17 @@ class _MockMpMhNetwork:
 
 
 def _build_sender_receiver(num_paths: int, num_packets: int, prop_delay: int = 2):
+    # Single hop: the one hop carries the full end-to-end delay, so
+    # hop_rtt == global_rtt == rtt.
     rtt = prop_delay * 2
     paths = [JamPath(prop_delay, 0.0, 0, i) for i in range(num_paths)]
     for i, path in enumerate(paths):
         path.set_global_path_index(i)
-    receiver = SimReceiver(input_paths=paths, rtt=rtt)
+    receiver = SimReceiver(input_paths=paths, hop_rtt=rtt)
     sender = SimSender(
         num_of_packets_to_send=num_packets,
-        rtt=rtt,
+        global_rtt=rtt,
+        hop_rtt=rtt,
         paths=paths,
         initial_epsilon=0.0,
         next_hop=receiver,
@@ -69,20 +72,24 @@ def _build_sender_node_receiver(num_paths: int, num_packets: int, prop_delay: in
         for i, path in enumerate(hop_paths):
             path.set_global_path_index(i + 1)
 
+    # Each hop carries prop_delay, so the per-hop RTT is `rtt`. This harness
+    # keeps SimSender's window logic identical to the single-value-RTT case by
+    # using global_rtt == hop_rtt == rtt.
     network = _MockMpMhNetwork(num_paths)
     node = Node(
         hop_num=1,
         input_paths=paths_hop0,
         output_paths=paths_hop1,
-        rtt=rtt,
+        hop_rtt=rtt,
         Network=network,
     )
-    receiver = SimReceiver(input_paths=paths_hop1, rtt=rtt)
+    receiver = SimReceiver(input_paths=paths_hop1, hop_rtt=rtt)
     node.next_hop = receiver
 
     sender = SimSender(
         num_of_packets_to_send=num_packets,
-        rtt=rtt,
+        global_rtt=rtt,
+        hop_rtt=rtt,
         paths=paths_hop0,
         initial_epsilon=0.0,
         next_hop=node,

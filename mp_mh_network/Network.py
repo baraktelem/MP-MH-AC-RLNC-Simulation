@@ -38,15 +38,17 @@ class Network:
         self.debug = debug
         self.path_epsilons = path_epsilons
         self.num_paths = num_paths
-        self.prop_delay = prop_delay
-        self.rtt = prop_delay * 2
+        self.prop_delay = prop_delay              # end-to-end one-way propagation
+        self.global_rtt = prop_delay * 2          # end-to-end sender<->receiver RTT
+        # Per-hop quantities (hop_rtt, hop_prop_delay) are defined by MpMhNetwork,
+        # the only truly multi-hop network. Single-hop networks just use global_rtt.
         self.threshold = threshold
         self.max_iterations = max_iterations
         if max_allowed_overlap is not None:
             assert max_allowed_overlap > 0
             self.max_allowed_overlap = max_allowed_overlap
         else:
-            self.max_allowed_overlap = 2 * num_paths * (self.rtt - 1) # 2*k = 2*P*(RTT-1)
+            self.max_allowed_overlap = 2 * num_paths * (self.global_rtt - 1) # 2*k = 2*P*(RTT-1)
         
         if num_packets_to_send is not None:
             assert num_packets_to_send > 0
@@ -182,22 +184,23 @@ class MPNetwork(Network):
             max_allowed_overlap, 
             debug
             )
-        # Paths
-        self.paths = [Path(prop_delay, epsilon, 0, i, debug=self.debug) for i, epsilon in enumerate(path_epsilons)]
+        # Paths (single hop: the one hop carries the full end-to-end delay)
+        self.paths = [Path(self.prop_delay, epsilon, 0, i, debug=self.debug) for i, epsilon in enumerate(path_epsilons)]
         for i, path in enumerate(self.paths):
             path.set_global_path_index(i)
         
-        # Units
+        # Units (single hop => hop RTT == global RTT)
         self.receiver = SimReceiver(
             self.paths, 
-            self.rtt, 
+            hop_rtt=self.global_rtt, 
             unit_name="SimReceiver",
             debug=self.debug,
             )
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
         self.sender = SimSender(
             num_of_packets_to_send=self.num_packets_to_send,
-            rtt=self.rtt,
+            global_rtt=self.global_rtt,
+            hop_rtt=self.global_rtt,
             paths=self.paths,
             initial_epsilon=init_eps,
             max_allowed_overlap=max_allowed_overlap,
@@ -207,7 +210,46 @@ class MPNetwork(Network):
             )
 
 
-class MpMhNetwork(Network):
+class MhNetwork(Network):
+    """Base for multi-hop networks. Splits the end-to-end RTT across the hops so
+    each hop's channel gets a per-hop one-way propagation delay (paper: tprop = H * tprop,h).
+
+    Concrete subclasses (MpMhNetwork, JamMpMhNetwork) build their own path/node
+    topology on top of the shared hop_rtt / hop_prop_delay defined here.
+    """
+
+    def __init__(
+        self,
+        path_epsilons,
+        initial_epsilon: float = None,
+        max_iterations: int = None,
+        num_packets_to_send: int = None,
+        num_paths: int = 4,
+        prop_delay: int = 6,
+        threshold: float = 0.0,
+        max_allowed_overlap: int = None,
+        num_hops: int = 3,
+        debug: bool = True,
+        ):
+        super().__init__(
+            path_epsilons,
+            initial_epsilon,
+            max_iterations, num_packets_to_send,
+            num_paths,
+            prop_delay,
+            threshold,
+            max_allowed_overlap,
+            debug
+            )
+        assert num_hops >= 1, f"num_hops must be >= 1, got {num_hops}"
+        self.num_hops = num_hops
+        self.num_nodes = num_hops - 1
+        assert self.prop_delay % num_hops == 0, "prop_delay (RTT/2) must be divisible by num_hops"
+        self.hop_prop_delay = self.prop_delay // num_hops   # per-hop one-way channel delay
+        self.hop_rtt = self.global_rtt // num_hops          # per-hop RTT
+
+
+class MpMhNetwork(MhNetwork):
     def __init__(
         self,
         path_epsilons: list[list[float]],
@@ -222,19 +264,16 @@ class MpMhNetwork(Network):
         debug: bool = True,
         ):
         super().__init__(
-            path_epsilons, 
-            initial_epsilon, 
-            max_iterations, num_packets_to_send, 
-            num_paths, 
-            prop_delay, 
-            threshold, 
-            max_allowed_overlap, 
+            path_epsilons,
+            initial_epsilon,
+            max_iterations, num_packets_to_send,
+            num_paths,
+            prop_delay,
+            threshold,
+            max_allowed_overlap,
+            num_hops,
             debug
             )
-        # Constants & Parameters
-        self.num_hops = num_hops
-        self.num_nodes = num_hops - 1
-        
         # Natural matching tracking
         self.global_paths_idx_by_r : list[int] = list(range(1, num_paths + 1))
         
@@ -242,7 +281,7 @@ class MpMhNetwork(Network):
         self.paths : list[list[Path]] = [[] for _ in range(num_hops)]
         for hop_idx in range(num_hops):
             for path_idx in range(num_paths):
-                path = Path(prop_delay, path_epsilons[hop_idx][path_idx], hop_idx, path_idx, debug=self.debug)
+                path = Path(self.hop_prop_delay, path_epsilons[hop_idx][path_idx], hop_idx, path_idx, debug=self.debug)
                 path.set_global_path_index(path_idx + 1)
                 self.paths[hop_idx].append(path)
         
@@ -253,7 +292,7 @@ class MpMhNetwork(Network):
                 hop_num=hop_idx,
                 input_paths=self.paths[hop_idx-1],
                 output_paths=self.paths[hop_idx],
-                rtt=self.rtt,
+                hop_rtt=self.hop_rtt,
                 unit_name=f"Node[{hop_idx}]",
                 Network=self,
                 debug=self.debug,
@@ -267,7 +306,7 @@ class MpMhNetwork(Network):
         # Receiver
         self.receiver = SimReceiver(
             input_paths=self.paths[-1],
-            rtt=self.rtt,
+            hop_rtt=self.hop_rtt,
             unit_name="SimReceiver",
             debug=self.debug,
             )
@@ -279,7 +318,8 @@ class MpMhNetwork(Network):
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
         self.sender = SimSender(
             num_of_packets_to_send=self.num_packets_to_send,
-            rtt=self.rtt,
+            global_rtt=self.global_rtt,
+            hop_rtt=self.hop_rtt,
             paths=self.paths[0],
             initial_epsilon=init_eps,
             max_allowed_overlap=max_allowed_overlap,

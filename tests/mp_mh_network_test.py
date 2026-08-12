@@ -2,52 +2,102 @@
 End-to-end tests for MpMhNetwork.
 
 These tests build a full multi-path multi-hop network
-(SimSender → Node(s) → SimReceiver) and run the simulation
-via run_sim().  They verify that all information packets are
-decoded by the SimReceiver.
+(SimSender -> Node(s) -> SimReceiver) and check two things:
+
+1. Functional correctness: run the simulation via run_sim() and verify that
+   every information packet is decoded by the SimReceiver.
+2. Timing: in a lossless network, verify the exact propagation timing of a
+   single packet as it travels hop-by-hop, plus the per-hop feedback timing.
+
+Timing model (verified against the implementation)
+---------------------------------------------------
+The whole network advances by one time step per SimSender.run_step() call, and
+each forward/feedback channel carries a per-hop one-way delay of hop_prop_delay
+(= prop_delay / num_hops = hop_rtt / 2).  A node receives on its input channel
+and forwards on its output channel within the *same* tick (no extra processing
+delay).  Therefore, for a packet first transmitted at t = send_time:
+
+  - It reaches the receiver after hop `h` at:  send_time + h * hop_prop_delay
+  - The final SimReceiver (after num_hops hops) gets it at:
+        send_time + num_hops * hop_prop_delay
+      = send_time + prop_delay
+      = send_time + global_rtt // 2          (one-way, i.e. half the end-to-end RTT)
+  - Feedback is hop-by-hop: each hop's sender hears back from its immediate
+    downstream receiver after a full per-hop round trip = hop_rtt
+    (= 2 * hop_prop_delay).
 
 Test naming convention:
-- MH1: 3 hops, 4 paths, eps=0 — baseline, all 100 packets decoded
-- MH2: 3 hops, 4 paths, eps=0.1 — light loss, all 100 packets decoded
-- MH3: Verify the full chain structure (sender → nodes → receiver)
-- MH4: 2 hops (1 node), 4 paths, eps=0 — minimal multi-hop
+- MH1: 3 hops, 4 paths, eps=0   -> baseline, all packets decoded
+- MH2: 3 hops, 4 paths, eps=0.1 -> light loss, all packets decoded
+- MH3: verify the full chain structure (sender -> nodes -> receiver)
+- MH4: 2 hops (1 node), 4 paths, eps=0 -> minimal multi-hop
+- MH5: timing - lossless per-hop forward arrival (send_time + h*hop_prop_delay)
+- MH6: timing - lossless per-hop feedback (ACK back at send_time + hop_rtt)
+- MH7: timing - 2-hop variant, forward arrival + receiver at global_rtt//2
 """
 
 import sys
 import os
 import random
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 
 from Network import MpMhNetwork
 
 
 # ============================================================================
-# MH1 — 3 hops, 4 paths, eps=0, 100 packets
+# Helpers
+# ============================================================================
+
+def _build_lossless_net(num_hops, num_paths, prop_delay, num_packets, max_iterations=None):
+    """Build a lossless (eps=0) MpMhNetwork."""
+    epsilons = [[0.0] * num_paths for _ in range(num_hops)]
+    return MpMhNetwork(
+        path_epsilons=epsilons,
+        num_packets_to_send=num_packets,
+        num_paths=num_paths,
+        prop_delay=prop_delay,
+        num_hops=num_hops,
+        max_iterations=max_iterations,
+        debug=False,
+    )
+
+
+def _forward_hops(net):
+    """Return an ordered list of (label, hops_traversed, receiver) for every
+    receiving stage: each Node's receiver, then the final SimReceiver."""
+    stages = []
+    for node in net.nodes:
+        # node.hop_num counts how many forward channels the packet crossed to
+        # reach this node's receiver (Node[0].hop_num == 1).
+        stages.append((node.unit_name, node.hop_num, node.my_receiver))
+    stages.append(("SimReceiver", net.num_hops, net.receiver))
+    return stages
+
+
+def _first_arrival_times(receiver):
+    """First-arrival time recorded on each of a receiver's input paths."""
+    return [p.get_receiving_packets_strating_time() for p in receiver.receiver_paths]
+
+
+# ============================================================================
+# MH1 - 3 hops, 4 paths, eps=0
 # ============================================================================
 
 def test_MH1_zero_loss_3_hops_4_paths():
-    """Baseline: no erasures anywhere.  All 100 information packets must
-    be decoded by the SimReceiver."""
+    """Baseline: no erasures anywhere. All information packets must be
+    decoded by the SimReceiver."""
     NUM_PACKETS = 100
     NUM_PATHS = 4
     NUM_HOPS = 3
-    PROP_DELAY = 2
+    PROP_DELAY = 6
 
     print(f"\n=== Test MH1: {NUM_HOPS} hops, {NUM_PATHS} paths, eps=0, "
           f"{NUM_PACKETS} packets ===")
 
-    epsilons = [[0.0] * NUM_PATHS for _ in range(NUM_HOPS)]
-
-    net = MpMhNetwork(
-        path_epsilons=epsilons,
-        num_packets_to_send=NUM_PACKETS,
-        num_paths=NUM_PATHS,
-        prop_delay=PROP_DELAY,
-        num_hops=NUM_HOPS,
-        # debug=False,
-    )
-
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, NUM_PACKETS)
     net.run_sim()
     stats = net.get_simulation_stats()
 
@@ -73,41 +123,31 @@ def test_MH1_zero_loss_3_hops_4_paths():
 
 
 # ============================================================================
-# MH2 — 3 hops, 4 paths, eps=0.1, 100 packets
+# MH2 - 3 hops, 4 paths, eps=0.1
 # ============================================================================
 
 def test_MH2_light_loss_3_hops_4_paths():
-    """50% erasures probability on every hop. The AC-RLNC protocol should still
-    deliver all 100 packets (FEC + FB-FEC compensate for losses)."""
-    NUM_PACKETS = 200
+    """Light erasures on every hop. The AC-RLNC protocol should still deliver
+    every packet (FEC + FB-FEC compensate for losses)."""
+    NUM_PACKETS = 100
     NUM_PATHS = 4
     NUM_HOPS = 3
     PROP_DELAY = 6
 
-    print(f"\n=== Test MH2: {NUM_HOPS} hops, {NUM_PATHS} paths, eps=0.5, "
+    print(f"\n=== Test MH2: {NUM_HOPS} hops, {NUM_PATHS} paths, eps=0.1, "
           f"{NUM_PACKETS} packets ===")
 
-    seed = random.randint(1, 50)
-    # random.seed(seed)
-    random.seed(29)
-    print(f"Seed: {seed}")
-    epsilons = [[0.5] * NUM_PATHS for _ in range(NUM_HOPS)]
-    # Debug prints happen in run_sim(), not in MpMhNetwork(); redirect must wrap run_sim().
-    _log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "test_MH2_light_loss_3_hops_4_paths.log",
+    random.seed(29)  # deterministic
+    epsilons = [[0.1] * NUM_PATHS for _ in range(NUM_HOPS)]
+    net = MpMhNetwork(
+        path_epsilons=epsilons,
+        num_packets_to_send=NUM_PACKETS,
+        num_paths=NUM_PATHS,
+        prop_delay=PROP_DELAY,
+        num_hops=NUM_HOPS,
+        debug=False,
     )
-    from contextlib import redirect_stdout
-    with open(_log_path, "w", encoding="utf-8") as _log_f, redirect_stdout(_log_f):
-        net = MpMhNetwork(
-            path_epsilons=epsilons,
-            num_packets_to_send=NUM_PACKETS,
-            num_paths=NUM_PATHS,
-            prop_delay=PROP_DELAY,
-            num_hops=NUM_HOPS,
-            debug=True,
-        )
-        net.run_sim()
+    net.run_sim()
     stats = net.get_simulation_stats()
 
     expected_packets = set(range(1, NUM_PACKETS + 1))
@@ -116,7 +156,7 @@ def test_MH2_light_loss_3_hops_4_paths():
     assert decoded_packets == expected_packets, \
         f"Decoded packets mismatch.\n  Missing: {expected_packets - decoded_packets}\n  Extra:   {decoded_packets - expected_packets}"
 
-    # Every decoded packet must have a valid decoding time > its sending time
+    # Every decoded packet must be decoded strictly after it was first sent.
     for pkt, decode_time in net.receiver.information_packets_decoding_times.items():
         send_time = net.sender.inforamtion_packets_first_transmission_times[pkt]
         assert decode_time > send_time, \
@@ -130,31 +170,22 @@ def test_MH2_light_loss_3_hops_4_paths():
 
 
 # ============================================================================
-# MH3 — Verify the chain structure
+# MH3 - Verify the chain structure
 # ============================================================================
 
 def test_MH3_chain_structure():
     """Build a 3-hop network and verify the wiring:
-    SimSender.next_hop → Node[0] → Node[1] → SimReceiver.
+    SimSender.next_hop -> Node[0] -> Node[1] -> SimReceiver.
     Also verify that after run_sim, every node received and forwarded packets,
     and the receiver decoded the exact expected set."""
     NUM_PACKETS = 50
     NUM_PATHS = 4
     NUM_HOPS = 3
-    PROP_DELAY = 2
+    PROP_DELAY = 6
 
     print(f"\n=== Test MH3: chain structure verification ===")
 
-    epsilons = [[0.0] * NUM_PATHS for _ in range(NUM_HOPS)]
-
-    net = MpMhNetwork(
-        path_epsilons=epsilons,
-        num_packets_to_send=NUM_PACKETS,
-        num_paths=NUM_PATHS,
-        prop_delay=PROP_DELAY,
-        num_hops=NUM_HOPS,
-        max_iterations=500,
-    )
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, NUM_PACKETS, max_iterations=500)
 
     # --- Verify wiring before running ---
     assert len(net.nodes) == NUM_HOPS - 1, \
@@ -210,30 +241,20 @@ def test_MH3_chain_structure():
 
 
 # ============================================================================
-# MH4 — 2 hops (1 node), 4 paths, eps=0
+# MH4 - 2 hops (1 node), 4 paths, eps=0
 # ============================================================================
 
 def test_MH4_two_hops_one_node():
-    """Minimal multi-hop: SimSender → Node[0] → SimReceiver.
-    Verifies the 2-hop case works correctly."""
+    """Minimal multi-hop: SimSender -> Node[0] -> SimReceiver."""
     NUM_PACKETS = 100
     NUM_PATHS = 4
     NUM_HOPS = 2
-    PROP_DELAY = 2
+    PROP_DELAY = 6
 
     print(f"\n=== Test MH4: {NUM_HOPS} hops, {NUM_PATHS} paths, eps=0, "
           f"{NUM_PACKETS} packets ===")
 
-    epsilons = [[0.0] * NUM_PATHS for _ in range(NUM_HOPS)]
-
-    net = MpMhNetwork(
-        path_epsilons=epsilons,
-        num_packets_to_send=NUM_PACKETS,
-        num_paths=NUM_PATHS,
-        prop_delay=PROP_DELAY,
-        num_hops=NUM_HOPS,
-        max_iterations=1000,
-    )
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, NUM_PACKETS, max_iterations=1000)
 
     assert len(net.nodes) == 1, f"Expected 1 node, got {len(net.nodes)}"
     assert net.sender.next_hop is net.nodes[0]
@@ -251,7 +272,7 @@ def test_MH4_two_hops_one_node():
     assert expected_packets.issubset(sent_packets), \
         f"Sender should have sent all info packets.\n  Missing: {expected_packets - sent_packets}"
 
-    # The single node must have received and forwarded
+    # The single node must have received and forwarded.
     node = net.nodes[0]
     node_new_info = node.my_sender.new_information_packets_history
     assert expected_packets.issubset(node_new_info), \
@@ -260,6 +281,146 @@ def test_MH4_two_hops_one_node():
     print(f"  Decoded:    {decoded_packets == expected_packets}")
     print(f"  Throughput: {net.get_simulation_stats().normalized_throughput:.3f}")
     print(f"  Time:       {net.t} steps")
+    print("  PASSED")
+
+
+# ============================================================================
+# MH5 - Timing: lossless per-hop forward arrival
+# ============================================================================
+
+def test_MH5_timing_forward_per_hop_lossless():
+    """In a lossless network, a packet first sent at t=send_time reaches the
+    receiver after hop `h` exactly at send_time + h * hop_prop_delay, and the
+    final SimReceiver gets it at send_time + prop_delay (= global_rtt // 2)."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6  # -> hop_prop_delay=2, hop_rtt=4, global_rtt=12
+
+    print(f"\n=== Test MH5: forward per-hop timing ({NUM_HOPS} hops) ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30)
+
+    assert net.hop_prop_delay == PROP_DELAY // NUM_HOPS == 2
+    assert net.hop_rtt == net.global_rtt // NUM_HOPS == 4
+    assert net.global_rtt == 2 * PROP_DELAY == 12
+
+    # Step long enough for the first packet to reach the receiver.
+    for _ in range(net.global_rtt + net.num_hops + 2):
+        net.sender.run_step()
+
+    send_time = net.sender.inforamtion_packets_first_transmission_times[1]
+    assert send_time == 1, f"First transmission expected at t=1, got {send_time}"
+
+    hpd = net.hop_prop_delay
+    for label, hops, receiver in _forward_hops(net):
+        expected = send_time + hops * hpd
+        arrivals = _first_arrival_times(receiver)
+        assert all(a is not None for a in arrivals), \
+            f"{label}: some path never received a packet: {arrivals}"
+        assert all(a == expected for a in arrivals), \
+            f"{label}: expected first arrival at t={expected} " \
+            f"(send_time {send_time} + {hops}*hop_prop_delay {hpd}), got {arrivals}"
+        print(f"  {label:14s} hops={hops} -> first arrival t={expected} (delta={hops*hpd})")
+
+    # The receiver's arrival delay is one-way = prop_delay = global_rtt // 2.
+    recv_arrival = _first_arrival_times(net.receiver)[0]
+    assert recv_arrival - send_time == net.prop_delay == net.num_hops * hpd == net.global_rtt // 2, \
+        f"Receiver delay {recv_arrival - send_time} should equal prop_delay {net.prop_delay} " \
+        f"= num_hops*hop_prop_delay = global_rtt//2 ({net.global_rtt // 2})"
+
+    print("  PASSED")
+
+
+# ============================================================================
+# MH6 - Timing: lossless per-hop feedback
+# ============================================================================
+
+def test_MH6_timing_feedback_per_hop_lossless():
+    """In a lossless network the SimSender hears back (ACK) about its first
+    transmission after a full per-hop round trip = hop_rtt:
+      - the ACK is created by Node[0] at send_time + hop_prop_delay
+      - it arrives back at the SimSender at send_time + hop_rtt
+    Also verify every path's feedback channel matches its forward channel's
+    per-hop propagation delay."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6  # -> hop_prop_delay=2, hop_rtt=4
+
+    print(f"\n=== Test MH6: feedback per-hop timing ({NUM_HOPS} hops) ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30)
+    hpd = net.hop_prop_delay
+
+    # Feedback channel per-hop delay must equal the forward channel delay.
+    for hop_idx, hop_paths in enumerate(net.paths):
+        for path in hop_paths:
+            assert path.forward_channel.get_propagation_delay() == hpd, \
+                f"Hop {hop_idx}: forward delay != hop_prop_delay ({hpd})"
+            assert path.feedback_channel.get_propagation_delay() == hpd, \
+                f"Hop {hop_idx}: feedback delay != hop_prop_delay ({hpd})"
+
+    # Step tick-by-tick and detect when the SimSender first receives feedback.
+    fb_arrival_tick = None
+    for _ in range(2 * net.hop_rtt + net.num_hops + 4):
+        net.sender.run_step()
+        if fb_arrival_tick is None and any(
+            len(p.all_feedback_history) > 0 for p in net.sender.paths
+        ):
+            fb_arrival_tick = net.sender.t
+
+    send_time = net.sender.inforamtion_packets_first_transmission_times[1]
+    assert send_time == 1, f"First transmission expected at t=1, got {send_time}"
+
+    assert fb_arrival_tick is not None, "SimSender never received feedback"
+    assert fb_arrival_tick - send_time == net.hop_rtt == 2 * hpd, \
+        f"SimSender feedback round trip {fb_arrival_tick - send_time} should equal " \
+        f"hop_rtt {net.hop_rtt} (= 2*hop_prop_delay {hpd})"
+
+    # The earliest feedback should be an ACK created one hop away (send_time + hpd).
+    all_fb = [fb for p in net.sender.paths for fb in p.all_feedback_history]
+    earliest = min(all_fb, key=lambda fb: fb.get_creation_time())
+    assert earliest.is_ack(), \
+        f"Earliest SimSender feedback should be an ACK, got {earliest.get_type()}"
+    assert earliest.get_creation_time() - send_time == hpd, \
+        f"ACK creation time delta {earliest.get_creation_time() - send_time} " \
+        f"should equal one hop delay hop_prop_delay ({hpd})"
+
+    print(f"  ACK created at t={earliest.get_creation_time()} (send_time + {hpd})")
+    print(f"  ACK back at SimSender at t={fb_arrival_tick} (send_time + hop_rtt {net.hop_rtt})")
+    print("  PASSED")
+
+
+# ============================================================================
+# MH7 - Timing: 2-hop variant
+# ============================================================================
+
+def test_MH7_timing_two_hops_lossless():
+    """Same forward-timing law with a different topology (2 hops): the receiver
+    is reached after num_hops * hop_prop_delay = prop_delay = global_rtt // 2."""
+    NUM_PATHS = 4
+    NUM_HOPS = 2
+    PROP_DELAY = 6  # -> hop_prop_delay=3, hop_rtt=6, global_rtt=12
+
+    print(f"\n=== Test MH7: forward timing ({NUM_HOPS} hops) ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30)
+    assert net.hop_prop_delay == 3 and net.hop_rtt == 6 and net.global_rtt == 12
+
+    for _ in range(net.global_rtt + net.num_hops + 2):
+        net.sender.run_step()
+
+    send_time = net.sender.inforamtion_packets_first_transmission_times[1]
+    hpd = net.hop_prop_delay
+
+    for label, hops, receiver in _forward_hops(net):
+        expected = send_time + hops * hpd
+        arrivals = _first_arrival_times(receiver)
+        assert all(a == expected for a in arrivals), \
+            f"{label}: expected first arrival at t={expected}, got {arrivals}"
+        print(f"  {label:14s} hops={hops} -> first arrival t={expected}")
+
+    recv_arrival = _first_arrival_times(net.receiver)[0]
+    assert recv_arrival - send_time == net.prop_delay == net.global_rtt // 2
     print("  PASSED")
 
 
@@ -276,6 +437,9 @@ def run_all_tests():
     test_MH2_light_loss_3_hops_4_paths()
     test_MH3_chain_structure()
     test_MH4_two_hops_one_node()
+    test_MH5_timing_forward_per_hop_lossless()
+    test_MH6_timing_feedback_per_hop_lossless()
+    test_MH7_timing_two_hops_lossless()
 
     print("\n" + "=" * 70)
     print("ALL MP-MH NETWORK TESTS PASSED!")
