@@ -305,19 +305,19 @@ def _run_main(*, debug: bool = False) -> None:
     # NUM_HOPS = 1
     num_hops_eff = effective_num_hops(NUM_HOPS)
 
-    RTT = 12
-    # RTT = 20
+    # RTT = 12
+    RTT = 12 // NUM_HOPS
     PROP_DELAY = RTT // 2
     THRESHOLD = 0.0
     k_mp = NUM_PATHS * (RTT - 1)
     O_BAR = 2 * NUM_PATHS * (RTT - 1)
     # NUM_PACKETS_TO_SEND = 200
     NUM_PACKETS_TO_SEND = 500
-    MAX_ITERATIONS = None
+    MAX_ITERATIONS = 2000
     NUM_ITERATIONS = 150
     LOAD_EXISTING = False
-    RESULTS_FILE = "mp_mh_simulation_results.pkl"
-    PLOT_FILE = "mp_mh_performance_3d.png"
+    RESULTS_FILE = "mp_mh_simulation_results_RTT_4.pkl"
+    PLOT_FILE = "mp_mh_performance_3d_RTT_4.png"
 
     article_preview = article_matrix_for_hops(0.1, 0.2, num_hops_eff)
     validate_article_matrix(article_preview, NUM_PATHS, num_hops_eff)
