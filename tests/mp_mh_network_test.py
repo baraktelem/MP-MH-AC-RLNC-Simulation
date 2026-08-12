@@ -13,14 +13,14 @@ Timing model (verified against the implementation)
 ---------------------------------------------------
 The whole network advances by one time step per SimSender.run_step() call, and
 each forward/feedback channel carries a per-hop one-way delay of hop_prop_delay
-(= prop_delay / num_hops = hop_rtt / 2).  A node receives on its input channel
+(= global_prop_delay / num_hops = hop_rtt / 2).  A node receives on its input channel
 and forwards on its output channel within the *same* tick (no extra processing
 delay).  Therefore, for a packet first transmitted at t = send_time:
 
   - It reaches the receiver after hop `h` at:  send_time + h * hop_prop_delay
   - The final SimReceiver (after num_hops hops) gets it at:
         send_time + num_hops * hop_prop_delay
-      = send_time + prop_delay
+      = send_time + global_prop_delay
       = send_time + global_rtt // 2          (one-way, i.e. half the end-to-end RTT)
   - Feedback is hop-by-hop: each hop's sender hears back from its immediate
     downstream receiver after a full per-hop round trip = hop_rtt
@@ -58,7 +58,7 @@ def _build_lossless_net(num_hops, num_paths, prop_delay, num_packets, max_iterat
         path_epsilons=epsilons,
         num_packets_to_send=num_packets,
         num_paths=num_paths,
-        prop_delay=prop_delay,
+        global_prop_delay=prop_delay,
         num_hops=num_hops,
         max_iterations=max_iterations,
         debug=False,
@@ -143,7 +143,7 @@ def test_MH2_light_loss_3_hops_4_paths():
         path_epsilons=epsilons,
         num_packets_to_send=NUM_PACKETS,
         num_paths=NUM_PATHS,
-        prop_delay=PROP_DELAY,
+        global_prop_delay=PROP_DELAY,
         num_hops=NUM_HOPS,
         debug=False,
     )
@@ -291,7 +291,7 @@ def test_MH4_two_hops_one_node():
 def test_MH5_timing_forward_per_hop_lossless():
     """In a lossless network, a packet first sent at t=send_time reaches the
     receiver after hop `h` exactly at send_time + h * hop_prop_delay, and the
-    final SimReceiver gets it at send_time + prop_delay (= global_rtt // 2)."""
+    final SimReceiver gets it at send_time + global_prop_delay (= global_rtt // 2)."""
     NUM_PATHS = 4
     NUM_HOPS = 3
     PROP_DELAY = 6  # -> hop_prop_delay=2, hop_rtt=4, global_rtt=12
@@ -322,10 +322,10 @@ def test_MH5_timing_forward_per_hop_lossless():
             f"(send_time {send_time} + {hops}*hop_prop_delay {hpd}), got {arrivals}"
         print(f"  {label:14s} hops={hops} -> first arrival t={expected} (delta={hops*hpd})")
 
-    # The receiver's arrival delay is one-way = prop_delay = global_rtt // 2.
+    # The receiver's arrival delay is one-way = global_prop_delay = global_rtt // 2.
     recv_arrival = _first_arrival_times(net.receiver)[0]
-    assert recv_arrival - send_time == net.prop_delay == net.num_hops * hpd == net.global_rtt // 2, \
-        f"Receiver delay {recv_arrival - send_time} should equal prop_delay {net.prop_delay} " \
+    assert recv_arrival - send_time == net.global_prop_delay == net.num_hops * hpd == net.global_rtt // 2, \
+        f"Receiver delay {recv_arrival - send_time} should equal global_prop_delay {net.global_prop_delay} " \
         f"= num_hops*hop_prop_delay = global_rtt//2 ({net.global_rtt // 2})"
 
     print("  PASSED")
@@ -396,7 +396,7 @@ def test_MH6_timing_feedback_per_hop_lossless():
 
 def test_MH7_timing_two_hops_lossless():
     """Same forward-timing law with a different topology (2 hops): the receiver
-    is reached after num_hops * hop_prop_delay = prop_delay = global_rtt // 2."""
+    is reached after num_hops * hop_prop_delay = global_prop_delay = global_rtt // 2."""
     NUM_PATHS = 4
     NUM_HOPS = 2
     PROP_DELAY = 6  # -> hop_prop_delay=3, hop_rtt=6, global_rtt=12
@@ -420,7 +420,7 @@ def test_MH7_timing_two_hops_lossless():
         print(f"  {label:14s} hops={hops} -> first arrival t={expected}")
 
     recv_arrival = _first_arrival_times(net.receiver)[0]
-    assert recv_arrival - send_time == net.prop_delay == net.global_rtt // 2
+    assert recv_arrival - send_time == net.global_prop_delay == net.global_rtt // 2
     print("  PASSED")
 
 

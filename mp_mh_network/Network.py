@@ -38,10 +38,10 @@ class Network:
         self.debug = debug
         self.path_epsilons = path_epsilons
         self.num_paths = num_paths
-        self.prop_delay = prop_delay              # end-to-end one-way propagation
-        self.global_rtt = prop_delay * 2          # end-to-end sender<->receiver RTT
-        # Per-hop quantities (hop_rtt, hop_prop_delay) are defined by MpMhNetwork,
-        # the only truly multi-hop network. Single-hop networks just use global_rtt.
+        self.global_prop_delay = prop_delay           # end-to-end one-way propagation
+        self.global_rtt = self.global_prop_delay * 2  # end-to-end sender<->receiver RTT
+        # Per-hop quantities (hop_rtt, hop_prop_delay) are defined by MhNetwork,
+        # the multi-hop base. Single-hop networks just use the global quantities.
         self.threshold = threshold
         self.max_iterations = max_iterations
         if max_allowed_overlap is not None:
@@ -118,7 +118,7 @@ class Network:
         all_trasmissions_by_sender = self.sender.sent_new_rlnc_history + self.sender.sent_fec_history + self.sender.sent_fb_fec_history
         self.sender_num_total_transmissions = len(all_trasmissions_by_sender)
         # Get last transmission time to arrive to receiver
-        last_transmission_time_to_arrive_to_receiver = self.t - self.prop_delay
+        last_transmission_time_to_arrive_to_receiver = self.t - self.global_prop_delay
         # Get number of transmissions that arrived to receiver
         self.sender_num_transmissions_arrived_to_receiver = len([transmission for transmission in all_trasmissions_by_sender if transmission.get_creation_time() <= last_transmission_time_to_arrive_to_receiver])
 
@@ -185,7 +185,7 @@ class MPNetwork(Network):
             debug
             )
         # Paths (single hop: the one hop carries the full end-to-end delay)
-        self.paths = [Path(self.prop_delay, epsilon, 0, i, debug=self.debug) for i, epsilon in enumerate(path_epsilons)]
+        self.paths = [Path(self.global_prop_delay, epsilon, 0, i, debug=self.debug) for i, epsilon in enumerate(path_epsilons)]
         for i, path in enumerate(self.paths):
             path.set_global_path_index(i)
         
@@ -225,7 +225,7 @@ class MhNetwork(Network):
         max_iterations: int = None,
         num_packets_to_send: int = None,
         num_paths: int = 4,
-        prop_delay: int = 6,
+        global_prop_delay: int = 6,
         threshold: float = 0.0,
         max_allowed_overlap: int = None,
         num_hops: int = 3,
@@ -236,7 +236,7 @@ class MhNetwork(Network):
             initial_epsilon,
             max_iterations, num_packets_to_send,
             num_paths,
-            prop_delay,
+            global_prop_delay,
             threshold,
             max_allowed_overlap,
             debug
@@ -244,9 +244,9 @@ class MhNetwork(Network):
         assert num_hops >= 1, f"num_hops must be >= 1, got {num_hops}"
         self.num_hops = num_hops
         self.num_nodes = num_hops - 1
-        assert self.prop_delay % num_hops == 0, "prop_delay (RTT/2) must be divisible by num_hops"
-        self.hop_prop_delay = self.prop_delay // num_hops   # per-hop one-way channel delay
-        self.hop_rtt = self.global_rtt // num_hops          # per-hop RTT
+        assert self.global_prop_delay % num_hops == 0, "global_prop_delay (RTT/2) must be divisible by num_hops"
+        self.hop_prop_delay = self.global_prop_delay // num_hops   # per-hop one-way channel delay
+        self.hop_rtt = self.global_rtt // num_hops                 # per-hop RTT
 
 
 class MpMhNetwork(MhNetwork):
@@ -257,7 +257,7 @@ class MpMhNetwork(MhNetwork):
         max_iterations: int = None,
         num_packets_to_send: int = None,
         num_paths: int = 4,
-        prop_delay: int = 6,
+        global_prop_delay: int = 6,
         threshold: float = 0.0,
         max_allowed_overlap: int = None,
         num_hops: int = 3,
@@ -268,7 +268,7 @@ class MpMhNetwork(MhNetwork):
             initial_epsilon,
             max_iterations, num_packets_to_send,
             num_paths,
-            prop_delay,
+            global_prop_delay,
             threshold,
             max_allowed_overlap,
             num_hops,

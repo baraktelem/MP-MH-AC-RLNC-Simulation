@@ -317,7 +317,7 @@ def _run_one(args: tuple) -> tuple[float, float, SimulationStats]:
         num_packets_to_send=num_packets,
         max_allowed_overlap=o_bar,
         num_paths=num_paths,
-        prop_delay=prop_delay,
+        global_prop_delay=prop_delay,
         threshold=threshold,
         num_hops=num_hops_eff,
         debug=debug,
@@ -367,11 +367,11 @@ def _run_main(*, debug: bool = False) -> None:
     O_BAR = 2 * NUM_PATHS * (RTT - 1)
     # NUM_PACKETS_TO_SEND = 200
     NUM_PACKETS_TO_SEND = 500
-    MAX_ITERATIONS = None
+    MAX_ITERATIONS = 40000
     NUM_ITERATIONS = 150
     LOAD_EXISTING = False
-    RESULTS_FILE = "mp_mh_simulation_results.pkl"
-    PLOT_FILE = "mp_mh_performance_3d.png"
+    RESULTS_FILE = f"mp_mh_simulation_results_global_RTT_{RTT}.pkl"
+    PLOT_FILE = f"mp_mh_simulation_results_3d_global_RTT_{RTT}.png"
     # CPU-bound pure-Python sims -> use processes (not threads). Default to half
     # the logical cores (~physical core count on hyper-threaded CPUs) to keep the
     # machine responsive. Force sequential under DEBUG so the stdout tee works.
