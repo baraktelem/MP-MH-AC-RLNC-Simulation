@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import pickle
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
@@ -289,6 +290,59 @@ class _StdoutTee:
             s.flush()
 
 
+def _run_one(args: tuple) -> tuple[float, float, SimulationStats]:
+    """Run a single MP-MH simulation from primitive args (picklable for spawn).
+
+    Reconstructs the network inside the worker so no complex objects cross the
+    process boundary; returns (eps1, eps2, stats) with stats a picklable
+    SimulationStats dataclass.
+    """
+    (
+        eps1,
+        eps2,
+        num_hops_eff,
+        num_paths,
+        prop_delay,
+        threshold,
+        o_bar,
+        num_packets,
+        max_iters,
+        debug,
+    ) = args
+    path_eps = build_path_epsilons(eps1, eps2, num_hops_eff)
+    network = MpMhNetwork(
+        path_epsilons=path_eps,
+        initial_epsilon=0.5,
+        max_iterations=max_iters,
+        num_packets_to_send=num_packets,
+        max_allowed_overlap=o_bar,
+        num_paths=num_paths,
+        prop_delay=prop_delay,
+        threshold=threshold,
+        num_hops=num_hops_eff,
+        debug=debug,
+    )
+    network.run_sim()
+    return (float(eps1), float(eps2), network.get_simulation_stats())
+
+
+def _execute(tasks: list[tuple], workers: int | None):
+    """Yield (done, total, result) for each task.
+
+    Sequential fallback when workers <= 1 (preserves DEBUG stdout tee); otherwise
+    dispatches to a ProcessPoolExecutor and yields as results complete.
+    """
+    total = len(tasks)
+    if workers is None or workers <= 1:
+        for i, task in enumerate(tasks, start=1):
+            yield i, total, _run_one(task)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_run_one, t) for t in tasks]
+            for done, fut in enumerate(as_completed(futures), start=1):
+                yield done, total, fut.result()
+
+
 def _run_main(*, debug: bool = False) -> None:
     """
     debug: When True (script DEBUG), stdout/stderr are teed to the log; we pass
@@ -305,19 +359,23 @@ def _run_main(*, debug: bool = False) -> None:
     # NUM_HOPS = 1
     num_hops_eff = effective_num_hops(NUM_HOPS)
 
-    # RTT = 12
-    RTT = 12 // NUM_HOPS
+    RTT = 12
+    # RTT = 20
     PROP_DELAY = RTT // 2
     THRESHOLD = 0.0
     k_mp = NUM_PATHS * (RTT - 1)
     O_BAR = 2 * NUM_PATHS * (RTT - 1)
     # NUM_PACKETS_TO_SEND = 200
     NUM_PACKETS_TO_SEND = 500
-    MAX_ITERATIONS = 2000
+    MAX_ITERATIONS = None
     NUM_ITERATIONS = 150
     LOAD_EXISTING = False
-    RESULTS_FILE = "mp_mh_simulation_results_RTT_4.pkl"
-    PLOT_FILE = "mp_mh_performance_3d_RTT_4.png"
+    RESULTS_FILE = "mp_mh_simulation_results.pkl"
+    PLOT_FILE = "mp_mh_performance_3d.png"
+    # CPU-bound pure-Python sims -> use processes (not threads). Default to half
+    # the logical cores (~physical core count on hyper-threaded CPUs) to keep the
+    # machine responsive. Force sequential under DEBUG so the stdout tee works.
+    PARALLEL_WORKERS = 1 if debug else max(1, (os.cpu_count() or 2) // 2)
 
     article_preview = article_matrix_for_hops(0.1, 0.2, num_hops_eff)
     validate_article_matrix(article_preview, NUM_PATHS, num_hops_eff)
@@ -329,6 +387,7 @@ def _run_main(*, debug: bool = False) -> None:
     print(f"  - Paths P = {NUM_PATHS}, hops H = {num_hops_eff} (NUM_HOPS config = {NUM_HOPS})")
     print(f"  - Packets per run: {NUM_PACKETS_TO_SEND}, max_iterations: {MAX_ITERATIONS}")
     print(f"  - Outer iterations: {NUM_ITERATIONS}")
+    print(f"  - Parallel workers: {PARALLEL_WORKERS} (logical cores: {os.cpu_count()})")
     print(
         f"  - DEBUG: {debug} (stdout tee + MpMhNetwork(debug={debug}) "
         f"so Sender/Node/Receiver prints reach the log)"
@@ -343,43 +402,42 @@ def _run_main(*, debug: bool = False) -> None:
         results = []
         total_per_iter = len(eps_values) ** 2
         total_sims = total_per_iter * NUM_ITERATIONS
-        sim_count = 0
         print(
             f"\nTotal simulations: {total_sims} "
             f"({NUM_ITERATIONS} × {total_per_iter} (ε₁,ε₂) pairs)\n{'=' * 70}\n"
         )
 
-        for iteration in range(1, NUM_ITERATIONS + 1):
-            print(f"\n{'=' * 70}\nIteration {iteration}/{NUM_ITERATIONS}\n{'=' * 70}\n")
+        tasks: list[tuple] = []
+        for _iteration in range(1, NUM_ITERATIONS + 1):
             for eps1 in eps_values:
                 for eps2 in eps_values:
-                    sim_count += 1
-                    path_eps = build_path_epsilons(eps1, eps2, num_hops_eff)
-                    cap = min_cut_capacity_for_epsilons(eps1, eps2, num_hops_eff)
-                    print(
-                        f"[{sim_count}/{total_sims}] iter {iteration}/{NUM_ITERATIONS}: "
-                        f"ε₁={eps1:.1f} ε₂={eps2:.1f} | min-cut ref={cap:.4f}"
+                    tasks.append(
+                        (
+                            eps1,
+                            eps2,
+                            num_hops_eff,
+                            NUM_PATHS,
+                            PROP_DELAY,
+                            THRESHOLD,
+                            O_BAR,
+                            NUM_PACKETS_TO_SEND,
+                            MAX_ITERATIONS,
+                            debug,
+                        )
                     )
-                    network = MpMhNetwork(
-                        path_epsilons=path_eps,
-                        initial_epsilon=0.5,
-                        max_iterations=MAX_ITERATIONS,
-                        num_packets_to_send=NUM_PACKETS_TO_SEND,
-                        max_allowed_overlap=O_BAR,
-                        num_paths=NUM_PATHS,
-                        prop_delay=PROP_DELAY,
-                        threshold=THRESHOLD,
-                        num_hops=num_hops_eff,
-                        debug=debug,
-                    )
-                    network.run_sim()
-                    stats = network.get_simulation_stats()
-                    results.append((eps1, eps2, stats))
-                    print(
-                        f"  → throughput: {stats.normalized_throughput:.4f}, "
-                        f"mean delay: {stats.inorder_delay_mean:.2f}, "
-                        f"max delay: {stats.inorder_delay_max}"
-                    )
+
+        for done, total, result in _execute(tasks, PARALLEL_WORKERS):
+            eps1, eps2, stats = result
+            results.append((eps1, eps2, stats))
+            if done % 50 == 0 or done == total:
+                cap = min_cut_capacity_for_epsilons(eps1, eps2, num_hops_eff)
+                print(
+                    f"[{done}/{total}] ε₁={eps1:.1f} ε₂={eps2:.1f} | "
+                    f"min-cut ref={cap:.4f} | "
+                    f"throughput: {stats.normalized_throughput:.4f}, "
+                    f"mean delay: {stats.inorder_delay_mean:.2f}, "
+                    f"max delay: {stats.inorder_delay_max}"
+                )
 
         print(f"\n{'=' * 70}\nAll {total_sims} simulations completed.\n{'=' * 70}")
         save_results(results, RESULTS_FILE)

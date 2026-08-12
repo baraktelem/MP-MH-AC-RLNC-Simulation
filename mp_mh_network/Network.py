@@ -77,13 +77,15 @@ class Network:
                     break
             self.t = t
             self.collect_stats()
-            print(f"Simulation completed at t={t} - all packets decoded")
+            if self.debug:
+                print(f"Simulation completed at t={t} - all packets decoded")
         else:
             while len(self.receiver.information_packets_decoding_times) < self.num_packets_to_send:
                 self.t += 1
                 self.sender.run_step()
             self.collect_stats()
-            print(f"Simulation completed at t={self.t} - all packets decoded")
+            if self.debug:
+                print(f"Simulation completed at t={self.t} - all packets decoded")
 
     def collect_stats(self):
         self.collect_sender_stats()
