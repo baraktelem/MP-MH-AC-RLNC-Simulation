@@ -46,7 +46,7 @@ from mh_epsilon_matrix import (
     article_matrix_for_hops,
 )
 from mh_min_cut_capacity import min_cut_capacity_for_epsilons
-from Network import MpMhNetwork, SimulationStats
+from Network import MpMhNetwork, SimulationStats, FeedbackSource
 
 
 def effective_num_hops(num_hops: int) -> int:
@@ -308,6 +308,7 @@ def _run_one(args: tuple) -> tuple[float, float, SimulationStats]:
         num_packets,
         max_iters,
         debug,
+        feedback_source,
     ) = args
     path_eps = build_path_epsilons(eps1, eps2, num_hops_eff)
     network = MpMhNetwork(
@@ -321,6 +322,7 @@ def _run_one(args: tuple) -> tuple[float, float, SimulationStats]:
         threshold=threshold,
         num_hops=num_hops_eff,
         debug=debug,
+        feedback_source=feedback_source,
     )
     network.run_sim()
     return (float(eps1), float(eps2), network.get_simulation_stats())
@@ -336,11 +338,23 @@ def _execute(tasks: list[tuple], workers: int | None):
     if workers is None or workers <= 1:
         for i, task in enumerate(tasks, start=1):
             yield i, total, _run_one(task)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(_run_one, t) for t in tasks]
-            for done, fut in enumerate(as_completed(futures), start=1):
-                yield done, total, fut.result()
+        return
+
+    pool = ProcessPoolExecutor(max_workers=workers)
+    futures: list = []
+    try:
+        futures = [pool.submit(_run_one, t) for t in tasks]
+        for done, fut in enumerate(as_completed(futures), start=1):
+            yield done, total, fut.result()
+    except (KeyboardInterrupt, GeneratorExit):
+        print("\n[INTERRUPTED] Cancelling pending simulations and terminating workers...")
+        for f in futures:
+            f.cancel()
+        for proc in list(getattr(pool, "_processes", {}).values()):
+            proc.terminate()
+        raise
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _run_main(*, debug: bool = False) -> None:
@@ -370,8 +384,11 @@ def _run_main(*, debug: bool = False) -> None:
     MAX_ITERATIONS = 40000
     NUM_ITERATIONS = 150
     LOAD_EXISTING = False
-    RESULTS_FILE = f"mp_mh_simulation_results_global_RTT_{RTT}.pkl"
-    PLOT_FILE = f"mp_mh_simulation_results_3d_global_RTT_{RTT}.png"
+    # Feedback source: FeedbackSource.HBH (hop-by-hop) or FeedbackSource.E2E (end-to-end).
+    FEEDBACK_SOURCE = FeedbackSource.E2E
+    _FB_TAG = FEEDBACK_SOURCE.name  # "HBH" or "E2E" -> keeps E2E and HBH outputs from colliding
+    RESULTS_FILE = f"mp_mh_simulation_results_global_RTT_{RTT}_{_FB_TAG}.pkl"
+    PLOT_FILE = f"mp_mh_simulation_results_3d_global_RTT_{RTT}_{_FB_TAG}.png"
     # CPU-bound pure-Python sims -> use processes (not threads). Default to half
     # the logical cores (~physical core count on hyper-threaded CPUs) to keep the
     # machine responsive. Force sequential under DEBUG so the stdout tee works.
@@ -386,6 +403,7 @@ def _run_main(*, debug: bool = False) -> None:
     print(f"  - k = P(RTT−1) = {k_mp}, ō = 2k = {O_BAR} (paper)")
     print(f"  - Paths P = {NUM_PATHS}, hops H = {num_hops_eff} (NUM_HOPS config = {NUM_HOPS})")
     print(f"  - Packets per run: {NUM_PACKETS_TO_SEND}, max_iterations: {MAX_ITERATIONS}")
+    print(f"  - Feedback source: {FEEDBACK_SOURCE.name}")
     print(f"  - Outer iterations: {NUM_ITERATIONS}")
     print(f"  - Parallel workers: {PARALLEL_WORKERS} (logical cores: {os.cpu_count()})")
     print(
@@ -423,6 +441,7 @@ def _run_main(*, debug: bool = False) -> None:
                             NUM_PACKETS_TO_SEND,
                             MAX_ITERATIONS,
                             debug,
+                            FEEDBACK_SOURCE,
                         )
                     )
 
@@ -433,6 +452,7 @@ def _run_main(*, debug: bool = False) -> None:
                 cap = min_cut_capacity_for_epsilons(eps1, eps2, num_hops_eff)
                 print(
                     f"[{done}/{total}] ε₁={eps1:.1f} ε₂={eps2:.1f} | "
+                    f"time slots: {stats.time_slots}, "
                     f"min-cut ref={cap:.4f} | "
                     f"throughput: {stats.normalized_throughput:.4f}, "
                     f"mean delay: {stats.inorder_delay_mean:.2f}, "

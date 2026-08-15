@@ -49,7 +49,6 @@ class Packet:
         self.creation_time = creation_time
         self.arrival_times: dict[str, int] = {}
         self.type = type
-        # self.id = PacketID(global_path_id, creation_time, type)
         self.id = PacketID(global_path_id, creation_time)
     
     def record_arrival_at(self, component_name: str, arrival_time: int):
@@ -94,11 +93,11 @@ class RLNCPacket(Packet):
     """
     
     def __init__(self,
-                 global_path_id: int,
-                 type: RLNCType,
-                  information_packets: list[int],
-                 prop_time_left_in_channel: int,
-                 creation_time: int):
+                global_path_id: int,
+                type: RLNCType,
+                information_packets: list[int],
+                prop_time_left_in_channel: int,
+                creation_time: int):
         super().__init__(global_path_id, prop_time_left_in_channel, creation_time, type)
         self.information_packets = information_packets.copy()  # Coefficients for RLNC
 

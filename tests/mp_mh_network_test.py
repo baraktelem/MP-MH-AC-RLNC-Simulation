@@ -44,14 +44,16 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 
-from Network import MpMhNetwork
+from Network import MpMhNetwork, FeedbackSource
+from Packet import RLNCPacket, RLNCType, NodeRLNCType, FeedbackType
 
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-def _build_lossless_net(num_hops, num_paths, prop_delay, num_packets, max_iterations=None):
+def _build_lossless_net(num_hops, num_paths, prop_delay, num_packets, max_iterations=None,
+                        feedback_source=FeedbackSource.HBH):
     """Build a lossless (eps=0) MpMhNetwork."""
     epsilons = [[0.0] * num_paths for _ in range(num_hops)]
     return MpMhNetwork(
@@ -62,6 +64,7 @@ def _build_lossless_net(num_hops, num_paths, prop_delay, num_packets, max_iterat
         num_hops=num_hops,
         max_iterations=max_iterations,
         debug=False,
+        feedback_source=feedback_source,
     )
 
 
@@ -425,6 +428,291 @@ def test_MH7_timing_two_hops_lossless():
 
 
 # ============================================================================
+# E2E1 - End-to-end feedback round-trip timing
+# ============================================================================
+
+def test_E2E1_feedback_roundtrip_timing():
+    """In E2E mode, feedback about a packet first transmitted at t0 returns to
+    the SimSender exactly at t0 + global_rtt (a full end-to-end round trip),
+    and the earliest feedback refers to the packet created at t0."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6  # -> hop_prop_delay=2, global_prop_delay=6, global_rtt=12
+
+    print(f"\n=== Test E2E1: end-to-end feedback round-trip timing ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
+                              feedback_source=FeedbackSource.E2E)
+    assert net.feedback_source == FeedbackSource.E2E
+    assert net.global_rtt == 12 and net.global_prop_delay == 6
+    assert set(net.e2e_feedback_channels.keys()) == set(range(1, NUM_PATHS + 1))
+    for ch in net.e2e_feedback_channels.values():
+        assert ch.get_propagation_delay() == net.global_prop_delay
+
+    fb_arrival_tick = None
+    for _ in range(net.global_rtt + net.num_hops + 4):
+        net.sender.run_step()
+        if fb_arrival_tick is None and any(
+            len(p.all_feedback_history) > 0 for p in net.sender.paths
+        ):
+            fb_arrival_tick = net.sender.t
+
+    send_time = net.sender.inforamtion_packets_first_transmission_times[1]
+    assert send_time == 1, f"First transmission expected at t=1, got {send_time}"
+
+    assert fb_arrival_tick is not None, "SimSender never received end-to-end feedback"
+    assert fb_arrival_tick - send_time == net.global_rtt, \
+        f"E2E feedback round trip {fb_arrival_tick - send_time} should equal " \
+        f"global_rtt {net.global_rtt}"
+
+    all_fb = [fb for p in net.sender.paths for fb in p.all_feedback_history]
+    earliest = min(all_fb, key=lambda fb: fb.get_related_packet_id().get_creation_time())
+    assert earliest.get_related_packet_id().get_creation_time() == send_time, \
+        f"Earliest E2E feedback should refer to the packet created at t0={send_time}, " \
+        f"got {earliest.get_related_packet_id().get_creation_time()}"
+
+    print(f"  Feedback back at SimSender at t={fb_arrival_tick} (send_time + global_rtt {net.global_rtt})")
+    print("  PASSED")
+
+
+# ============================================================================
+# E2E2 - Receiver ACK vs NACK decision (DROPPED marker -> NACK)
+# ============================================================================
+
+def test_E2E2_receiver_ack_vs_nack():
+    """The SimReceiver in E2E mode emits exactly one end-to-end feedback per
+    global path each tick: ACK for a clean arrival, NACK for a DROPPED-typed
+    arrival (upstream erasure marker), and NACK for any global path that did not
+    arrive (erased on the last hop). Every feedback references
+    (carried global path, t - global_prop_delay). Feedback is label-complete
+    (one per global path) regardless of which physical path carried each label,
+    which is what keeps the source's per-(label, creation_time) bookkeeping
+    consistent once nodes re-run natural matching."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6
+
+    print(f"\n=== Test E2E2: receiver ACK vs NACK (label-complete) ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
+                              feedback_source=FeedbackSource.E2E)
+    receiver = net.receiver
+    gpd = net.global_prop_delay
+    receiver.t = gpd + 5  # past the warm-up guard so feedback is emitted
+
+    # This tick's arrivals: clean NEW carrying global path 1, DROPPED marker
+    # carrying global path 2. Global paths 3 and 4 did not arrive (erased).
+    clean_pkt = RLNCPacket(global_path_id=1, type=RLNCType.NEW,
+                           information_packets=[10, 11],
+                           prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
+    dropped_pkt = RLNCPacket(global_path_id=2, type=NodeRLNCType.DROPPED,
+                             information_packets=[12],
+                             prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
+    receiver._e2e_arrivals_this_tick = [clean_pkt, dropped_pkt]
+    receiver._send_e2e_feedbacks()
+
+    def _last_on_channel(gp):
+        ch = net.e2e_feedback_channels[gp]
+        assert len(ch.packets_in_channel) == 1, \
+            f"Expected exactly one feedback on e2e channel {gp}, got {len(ch.packets_in_channel)}"
+        return ch.packets_in_channel[-1]
+
+    # Clean arrival on global path 1 -> ACK
+    ack = _last_on_channel(1)
+    assert ack.is_ack(), f"Clean arrival should yield an ACK, got {ack.get_type()}"
+    assert ack.get_related_packet_id().get_creation_time() == receiver.t - gpd
+    assert ack.get_related_packet_id().get_global_path_id() == 1
+
+    # DROPPED-typed arrival on global path 2 -> NACK
+    nack2 = _last_on_channel(2)
+    assert nack2.is_nack(), f"DROPPED-typed arrival should yield a NACK, got {nack2.get_type()}"
+    assert nack2.get_related_packet_id().get_creation_time() == receiver.t - gpd
+    assert nack2.get_related_packet_id().get_global_path_id() == 2
+
+    # Missing global paths 3 and 4 -> NACK each
+    for gp in (3, 4):
+        nack = _last_on_channel(gp)
+        assert nack.is_nack(), f"Missing global path {gp} should yield a NACK, got {nack.get_type()}"
+        assert nack.get_related_packet_id().get_creation_time() == receiver.t - gpd
+        assert nack.get_related_packet_id().get_global_path_id() == gp
+
+    print("  ACK on clean, NACK on DROPPED, NACK on missing labels - all correct")
+    print("  PASSED")
+
+
+# ============================================================================
+# E2E3 - NodeSender propagates the DROPPED marker only in E2E mode
+# ============================================================================
+
+def test_E2E3_nodesender_dropped_marker():
+    """A NodeSender in E2E mode emits a NodeRLNCType.DROPPED-typed packet (still
+    filled from the correction buffer) when the matched global-path type is
+    DROPPED; in HBH mode the same situation yields a CORRECTION packet."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6
+
+    print(f"\n=== Test E2E3: NodeSender DROPPED marker (E2E) vs CORRECTION (HBH) ===")
+
+    # E2E: DROPPED type in -> DROPPED-typed packet out
+    net_e2e = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
+                                  feedback_source=FeedbackSource.E2E)
+    node_sender = net_e2e.nodes[0].my_sender
+    node_sender.correction_information_packets_buffer = {5, 6}
+    path = node_sender.paths[0]
+    pkt = node_sender.create_rlnc(path, NodeRLNCType.DROPPED)
+    assert pkt is not None, "DROPPED packet should be created when correction buffer is non-empty"
+    assert pkt.get_type() == NodeRLNCType.DROPPED, \
+        f"E2E NodeSender should emit DROPPED type, got {pkt.get_type()}"
+    assert set(pkt.get_information_packets()) == {5, 6}, \
+        "DROPPED packet must still carry correction-buffer content"
+
+    # HBH: DROPPED type in -> CORRECTION packet out (unchanged behavior)
+    net_hbh = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
+                                  feedback_source=FeedbackSource.HBH)
+    node_sender_hbh = net_hbh.nodes[0].my_sender
+    node_sender_hbh.correction_information_packets_buffer = {5, 6}
+    path_hbh = node_sender_hbh.paths[0]
+    pkt_hbh = node_sender_hbh.create_rlnc(path_hbh, NodeRLNCType.DROPPED)
+    assert pkt_hbh.get_type() == NodeRLNCType.CORRECTION, \
+        f"HBH NodeSender should emit CORRECTION type, got {pkt_hbh.get_type()}"
+
+    print("  E2E -> DROPPED, HBH -> CORRECTION")
+    print("  PASSED")
+
+
+# ============================================================================
+# E2E4 - Full decode end-to-end (lossless and light loss)
+# ============================================================================
+
+def test_E2E4_full_decode_lossless():
+    """With end-to-end feedback and no erasures, every information packet is
+    still decoded by the SimReceiver."""
+    NUM_PACKETS = 100
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6
+
+    print(f"\n=== Test E2E4: E2E full decode, lossless ({NUM_HOPS} hops) ===")
+
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, NUM_PACKETS,
+                              feedback_source=FeedbackSource.E2E)
+    net.run_sim()
+
+    expected_packets = set(range(1, NUM_PACKETS + 1))
+    decoded_packets = set(net.receiver.information_packets_decoding_times.keys())
+    assert decoded_packets == expected_packets, \
+        f"Decoded packets mismatch.\n  Missing: {expected_packets - decoded_packets}\n  Extra:   {decoded_packets - expected_packets}"
+    assert net.get_simulation_stats().num_transmissions_dropped == 0
+
+    print(f"  Decoded all {NUM_PACKETS} packets in {net.t} steps")
+    print("  PASSED")
+
+
+def test_E2E5_full_decode_light_loss():
+    """With end-to-end feedback and light erasures on every hop, the AC-RLNC
+    protocol still delivers every packet end-to-end."""
+    NUM_PACKETS = 60
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6
+
+    print(f"\n=== Test E2E5: E2E full decode, light loss ({NUM_HOPS} hops) ===")
+
+    random.seed(29)  # deterministic
+    epsilons = [[0.1] * NUM_PATHS for _ in range(NUM_HOPS)]
+    net = MpMhNetwork(
+        path_epsilons=epsilons,
+        num_packets_to_send=NUM_PACKETS,
+        num_paths=NUM_PATHS,
+        global_prop_delay=PROP_DELAY,
+        num_hops=NUM_HOPS,
+        max_iterations=40000,
+        debug=False,
+        feedback_source=FeedbackSource.E2E,
+    )
+    net.run_sim()
+
+    expected_packets = set(range(1, NUM_PACKETS + 1))
+    decoded_packets = set(net.receiver.information_packets_decoding_times.keys())
+    assert decoded_packets == expected_packets, \
+        f"Decoded packets mismatch.\n  Missing: {expected_packets - decoded_packets}\n  Extra:   {decoded_packets - expected_packets}"
+
+    # Sanity: end-to-end feedback actually flowed (both ACKs and NACKs seen).
+    assert len(net.sender.acked_feedback_history) > 0, "Expected some E2E ACKs at the sender"
+    assert len(net.sender.nacked_feedback_history) > 0, "Expected some E2E NACKs at the sender"
+
+    print(f"  Decoded all {NUM_PACKETS} packets in {net.t} steps")
+    print(f"  E2E ACKs: {len(net.sender.acked_feedback_history)}, "
+          f"NACKs: {len(net.sender.nacked_feedback_history)}")
+    print("  PASSED")
+
+
+# ============================================================================
+# E2E6 - Last node receives per-hop feedback in E2E (for natural matching)
+# ============================================================================
+
+def test_E2E6_last_node_receives_per_hop_feedback():
+    """In E2E mode the destination SimReceiver still emits per-hop feedback on
+    the last hop, so the last Node's sender gets ACK/NACKs on its output paths
+    and can estimate r for natural matching (like every other node).
+
+    Lossless: ACKs flow, so every last-node path accumulates feedback and full
+    decode still succeeds.
+    Light loss: NACKs move at least one last-node path's r off its initial value
+    (1 - initial_epsilon = 1.0)."""
+    NUM_PATHS = 4
+    NUM_HOPS = 3
+    PROP_DELAY = 6
+
+    print(f"\n=== Test E2E6: last node per-hop feedback (E2E) ===")
+
+    # --- Lossless: feedback flows to the last node, full decode still works ---
+    net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=100,
+                              feedback_source=FeedbackSource.E2E)
+    net.run_sim()
+
+    last_node_sender = net.nodes[-1].my_sender
+    for path in last_node_sender.paths:
+        assert len(path.all_feedback_history) > 0, \
+            "Last node path received no per-hop feedback in E2E (lossless)"
+
+    expected_packets = set(range(1, 100 + 1))
+    decoded_packets = set(net.receiver.information_packets_decoding_times.keys())
+    assert decoded_packets == expected_packets, \
+        f"Decoded packets mismatch.\n  Missing: {expected_packets - decoded_packets}\n  Extra:   {decoded_packets - expected_packets}"
+
+    # --- Light loss: at least one last-node path adapts r away from initial ---
+    random.seed(29)  # deterministic
+    NUM_PACKETS = 60
+    epsilons = [[0.1] * NUM_PATHS for _ in range(NUM_HOPS)]
+    net_loss = MpMhNetwork(
+        path_epsilons=epsilons,
+        num_packets_to_send=NUM_PACKETS,
+        num_paths=NUM_PATHS,
+        global_prop_delay=PROP_DELAY,
+        num_hops=NUM_HOPS,
+        max_iterations=40000,
+        debug=False,
+        feedback_source=FeedbackSource.E2E,
+    )
+    net_loss.run_sim()
+
+    last_node_sender = net_loss.nodes[-1].my_sender
+    initial_r = 1.0 - last_node_sender.initial_epsilon
+    for path in last_node_sender.paths:
+        assert len(path.all_feedback_history) > 0, \
+            "Last node path received no per-hop feedback in E2E (light loss)"
+    adapted = [p for p in last_node_sender.paths if p.r != initial_r]
+    assert len(adapted) > 0, \
+        f"No last-node path adapted r off its initial value {initial_r} under loss"
+
+    print(f"  Last node paths with feedback: {len(last_node_sender.paths)}, "
+          f"adapted r: {len(adapted)}")
+    print("  PASSED")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -440,6 +728,12 @@ def run_all_tests():
     test_MH5_timing_forward_per_hop_lossless()
     test_MH6_timing_feedback_per_hop_lossless()
     test_MH7_timing_two_hops_lossless()
+    test_E2E1_feedback_roundtrip_timing()
+    test_E2E2_receiver_ack_vs_nack()
+    test_E2E3_nodesender_dropped_marker()
+    test_E2E4_full_decode_lossless()
+    test_E2E5_full_decode_light_loss()
+    test_E2E6_last_node_receives_per_hop_feedback()
 
     print("\n" + "=" * 70)
     print("ALL MP-MH NETWORK TESTS PASSED!")

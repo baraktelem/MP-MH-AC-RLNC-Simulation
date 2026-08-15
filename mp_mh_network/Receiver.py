@@ -1,6 +1,7 @@
 from Packet import Packet, RLNCPacket, FeedbackPacket, RLNCType, NodeRLNCType, FeedbackType, PacketID
-from Channels import Path
+from Channels import Path, Channel
 from CodedEquation import CodedEquation
+from feedback_source import FeedbackSource
 # from typing import Optional
 import copy
 
@@ -182,11 +183,26 @@ class SimReceiver(GeneralReceiver):
                 input_paths: list[Path],
                 hop_rtt: int,
                 unit_name: str=None,
-                debug: bool = False):
+                debug: bool = False,
+                feedback_source: FeedbackSource = FeedbackSource.HBH,
+                e2e_feedback_channels: dict[int, Channel] = None,
+                e2e_prop_delay: int = None):
         # Set unit name before calling super() for setting name that is not "GeneralReceiver"
         if unit_name is None:
             unit_name = "SimReceiver"
         super().__init__(input_paths, hop_rtt, unit_name, debug=debug)
+
+        # End-to-end feedback wiring
+        self.feedback_source = feedback_source
+        assert feedback_source in (FeedbackSource.HBH, FeedbackSource.E2E), \
+            f"Invalid feedback source: {feedback_source}"
+        if feedback_source == FeedbackSource.E2E:
+            assert e2e_feedback_channels is not None, \
+                "E2E feedback channels are required for end-to-end feedback"
+            assert e2e_prop_delay is not None, \
+                "E2E propagation delay (global one-way delay) is required for end-to-end feedback"
+        self.e2e_feedback_channels = e2e_feedback_channels
+        self.e2e_prop_delay = e2e_prop_delay  # global (end-to-end) one-way delay = global_rtt / 2
 
         # Decoding
         self.coded_equations : list[CodedEquation] = [] # All undecoded equations
@@ -196,8 +212,102 @@ class SimReceiver(GeneralReceiver):
         # Statistics
         self.information_packets_decoding_times : dict[int, int] = {} # Mapping for each information packet to the time it was decoded
 
+        # E2E feedback: packets that arrived this tick (carried global label is
+        # authoritative). Collected during run_step, then turned into exactly one
+        # end-to-end feedback per global path in _send_e2e_feedbacks.
+        self._e2e_arrivals_this_tick : list[RLNCPacket] = []
+
+    def run_step(self, time: int=None):
+        # Base step: per-hop feedback (to the last node, HBH and E2E alike) plus
+        # decoding. Arrivals are captured in _after_rlnc_arrived below.
+        self._e2e_arrivals_this_tick = []
+        super().run_step(time)
+        # End-to-end feedback to the source is emitted as a label-complete pass
+        # once all arrivals for this tick are known (see _send_e2e_feedbacks).
+        if self.feedback_source == FeedbackSource.E2E:
+            self._send_e2e_feedbacks()
+
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
+        if self.feedback_source == FeedbackSource.E2E:
+            self._e2e_arrivals_this_tick.append(arrived_packet)
         self.decode_packets(arrived_packet)
+
+    def _send_e2e_feedbacks(self) -> None:
+        """Emit exactly one end-to-end feedback per global path for this tick.
+
+        Per-hop feedback to the last node is handled by the base send_ack/send_nack
+        during super().run_step(); this pass is only the end-to-end feedback to the
+        source. It must be label-complete: because intermediate nodes (including
+        the last one) re-run natural matching every tick, a packet's carried global
+        label comes from the matching in force when it was *forwarded*, which can
+        differ from the physical path's current label. All packets arriving at the
+        receiver in a single tick were forwarded by the last node at the same time,
+        so their carried labels form a subset of one bijection over {1..P} and are
+        therefore distinct. We ACK/NACK those carried labels, then NACK every
+        remaining global path (the labels erased on the last hop). Doing it per
+        physical empty slot instead would mismatch the carried labels and produce
+        duplicate/missing feedback for the same (label, creation_time)."""
+        # Warm-up: before the first end-to-end packet could have arrived there is
+        # nothing to ACK and we must not invent NACKs for not-yet-flowing labels.
+        if self.t <= self.e2e_prop_delay:
+            return
+
+        creation_time = self.t - self.e2e_prop_delay
+        arrived_global_paths : set[int] = set()
+        
+        # Send feedback for each arrived packet
+        for arrived_packet in self._e2e_arrivals_this_tick:
+            global_path_id = arrived_packet.get_global_path()
+            arrived_global_paths.add(global_path_id)
+            related_packet_id = PacketID(
+                global_path_id=global_path_id,
+                creation_time=creation_time,
+            )
+            # A DROPPED-typed arrival is an upstream-erasure marker => NACK it
+            # end-to-end; any other arrival is a genuine delivery => ACK.
+            if arrived_packet.get_type() == NodeRLNCType.DROPPED:
+                self.sim_print(f"E2E: sending NACK (DROPPED marker) for {related_packet_id}")
+                self._send_e2e_feedback_on_a_channel(global_path_id, FeedbackType.NACK, related_packet_id, None)
+            else:
+                self.sim_print(f"E2E: sending ACK for {related_packet_id}")
+                self._send_e2e_feedback_on_a_channel(
+                    global_path_id, FeedbackType.ACK, related_packet_id,
+                    arrived_packet.get_information_packets(),
+                )
+
+        # NACK every global path that did not arrive this tick (erased on the last hop).
+        for global_path_id in self.e2e_feedback_channels.keys():
+            if global_path_id in arrived_global_paths:
+                continue
+            related_packet_id = PacketID(
+                global_path_id=global_path_id,
+                creation_time=creation_time,
+            )
+            self.sim_print(f"E2E: sending NACK (missing label) for {related_packet_id}")
+            self._send_e2e_feedback_on_a_channel(global_path_id, FeedbackType.NACK, related_packet_id, None)
+
+    def _send_e2e_feedback_on_a_channel(self,
+                           global_path_id: int,
+                           feedback_type: FeedbackType,
+                           related_packet_id: PacketID,
+                           related_information_packets) -> None:
+        """Emit a feedback packet onto the dedicated end-to-end channel for the
+        given global path, with the full end-to-end one-way delay, and keep the
+        sent-feedback history bookkeeping consistent with the HBH path."""
+        channel = self.e2e_feedback_channels[global_path_id]
+        feedback_packet = FeedbackPacket(
+            global_path_id=global_path_id,
+            type=feedback_type,
+            related_packet_id=related_packet_id,
+            prop_time_left_in_channel=self.e2e_prop_delay,
+            creation_time=self.t,
+            related_information_packets=related_information_packets,
+        )
+        feedback_packet.record_arrival_at(channel.channel_name, self.t)
+        # add_packets_to_channel resets prop_time_left to the channel's delay
+        # (= global_prop_delay), so the feedback carries the end-to-end delay.
+        channel.add_packets_to_channel([feedback_packet], time=self.t)
+        self.add_sent_feedback_packet_to_history(copy.copy(feedback_packet))
 
     def update_information_packets_decode_times(self, information_packets: list[int]):
         self.sim_print(f"update_information_packets_decode_times: Updating information packets decoding times for packets:\n\t{information_packets}")
@@ -275,13 +385,10 @@ class NodeReceiver(GeneralReceiver):
         self.global_paths_rlnc_types = {}
         super().run_step(time)
         # Mark all dropped packets in mapping
-        for path in self.receiver_paths: # Iterate over paths instead of over indices as old code
+        for path in self.receiver_paths: 
             global_path_idx = path.get_global_path_index()
             if self.global_paths_rlnc_types.get(global_path_idx, None) is None:
                 self.global_paths_rlnc_types[global_path_idx] = NodeRLNCType.DROPPED
-        # for path_idx in range(1,self.num_of_input_paths+1): # Old code - Iterate over indices instead of paths
-        #     if self.global_paths_rlnc_types.get(path_idx, None) is None:
-        #         self.global_paths_rlnc_types[path_idx] = NodeRLNCType.DROPPED
     
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         """This function is called for each RLNC that arrives on a path. It does the following:

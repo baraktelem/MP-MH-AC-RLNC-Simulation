@@ -1,10 +1,11 @@
-from Channels import Path
+import sys
+from dataclasses import dataclass
+
+from Channels import Path, Channel
+from feedback_source import FeedbackSource
 from Sender import SimSender
 from Receiver import SimReceiver
 from Node import Node
-
-import sys
-from dataclasses import dataclass
 
 @dataclass
 class SimulationStats:
@@ -12,6 +13,7 @@ class SimulationStats:
     inorder_delay_mean : float = 0.0 # Mean inorder delay at the end of simulation
     inorder_delay_max : int = 0 # Max inorder delay at the end of simulation
 
+    time_slots : int = 0 # Total number of time slots the simulation ran for
     num_new_rlnc_packets : int = 0 # Number of new RLNC packets sent by sender
     num_fec_packets : int = 0 # Number of FEC packets sent by sender
     num_fb_fec_packets : int = 0 # Number of FB-FEC packets sent by sender
@@ -98,6 +100,7 @@ class Network:
             inorder_delay_mean=self.inorder_delay_mean,
             inorder_delay_max=self.inorder_delay_max,
             num_new_rlnc_packets=len(self.sender.sent_new_rlnc_history),
+            time_slots=self.t,
             num_fec_packets=len(self.sender.sent_fec_history),
             num_fb_fec_packets=len(self.sender.sent_fb_fec_history),
             num_transmissions=self.sender_num_total_transmissions,
@@ -262,6 +265,7 @@ class MpMhNetwork(MhNetwork):
         max_allowed_overlap: int = None,
         num_hops: int = 3,
         debug: bool = True,
+        feedback_source: FeedbackSource = FeedbackSource.HBH,
         ):
         super().__init__(
             path_epsilons,
@@ -274,9 +278,30 @@ class MpMhNetwork(MhNetwork):
             num_hops,
             debug
             )
+        # Feedback source (hop-by-hop vs end-to-end)
+        assert feedback_source in (FeedbackSource.HBH, FeedbackSource.E2E), \
+            f"Invalid feedback source: {feedback_source}"
+        self.feedback_source = feedback_source
+
         # Natural matching tracking
         self.global_paths_idx_by_r : list[int] = list(range(1, num_paths + 1))
-        
+
+        # End-to-end feedback channels: one dedicated channel per global path,
+        # carrying ACK/NACKs straight from the SimReceiver back to the SimSender
+        # with the full end-to-end one-way delay (global_prop_delay).
+        self.e2e_feedback_channels : dict[int, Channel] = {}
+        if self.feedback_source == FeedbackSource.E2E:
+            for global_path_idx in range(1, num_paths + 1):
+                channel = Channel(
+                    self.global_prop_delay,
+                    hop_index=0,
+                    path_index_in_hop=global_path_idx - 1,
+                    name_prefix=f"E2E[{global_path_idx}].",
+                    debug=self.debug,
+                )
+                channel.set_global_path_index(global_path_idx)
+                self.e2e_feedback_channels[global_path_idx] = channel
+
         # Paths
         self.paths : list[list[Path]] = [[] for _ in range(num_hops)]
         for hop_idx in range(num_hops):
@@ -296,6 +321,7 @@ class MpMhNetwork(MhNetwork):
                 unit_name=f"Node[{hop_idx}]",
                 Network=self,
                 debug=self.debug,
+                feedback_source=self.feedback_source,
             )
             # Connect previous node to current node
             if hop_idx > 1:
@@ -309,6 +335,9 @@ class MpMhNetwork(MhNetwork):
             hop_rtt=self.hop_rtt,
             unit_name="SimReceiver",
             debug=self.debug,
+            feedback_source=self.feedback_source,
+            e2e_feedback_channels=self.e2e_feedback_channels,
+            e2e_prop_delay=self.global_prop_delay,
             )
         # Connect last node to receiver
         if num_hops > 1:
@@ -327,6 +356,8 @@ class MpMhNetwork(MhNetwork):
             network=self,
             next_hop=self.nodes[0] if num_hops > 1 else self.receiver,
             debug=self.debug,
+            feedback_source=self.feedback_source,
+            e2e_feedback_channels=self.e2e_feedback_channels,
         )
         
     def update_natural_matching(self, global_paths_idx_by_r: list[int]):
