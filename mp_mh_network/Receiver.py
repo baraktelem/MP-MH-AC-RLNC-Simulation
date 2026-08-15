@@ -233,7 +233,7 @@ class SimReceiver(GeneralReceiver):
         self.decode_packets(arrived_packet)
 
     def _send_e2e_feedbacks(self) -> None:
-        """Emit exactly one end-to-end feedback per global path for this tick.
+        """Send exactly one end-to-end feedback *per global path* for this tick.
 
         Per-hop feedback to the last node is handled by the base send_ack/send_nack
         during super().run_step(); this pass is only the end-to-end feedback to the
@@ -243,10 +243,17 @@ class SimReceiver(GeneralReceiver):
         differ from the physical path's current label. All packets arriving at the
         receiver in a single tick were forwarded by the last node at the same time,
         so their carried labels form a subset of one bijection over {1..P} and are
-        therefore distinct. We ACK/NACK those carried labels, then NACK every
-        remaining global path (the labels erased on the last hop). Doing it per
-        physical empty slot instead would mismatch the carried labels and produce
-        duplicate/missing feedback for the same (label, creation_time)."""
+        therefore distinct. We ACK those carried labels, then NACK every remaining
+        global path (the labels erased on the last hop). Doing it per physical empty
+        slot instead would mismatch the carried labels and produce duplicate/missing
+        feedback for the same (label, creation_time).
+
+        Every arrival is ACKed: intermediate nodes recode (they re-send from their
+        correction buffer to fill slots left empty by upstream erasures) instead of
+        forwarding a per-hop DROPPED marker, so an arrival is always a genuine
+        delivery on that global path. Consequently the only end-to-end NACKs are for
+        labels erased on the last hop, which keeps each global path at its min-cut
+        (bottleneck-hop) rate rather than the product of the per-hop erasures."""
         # Warm-up: before the first end-to-end packet could have arrived there is
         # nothing to ACK and we must not invent NACKs for not-yet-flowing labels.
         if self.t <= self.e2e_prop_delay:
@@ -254,8 +261,9 @@ class SimReceiver(GeneralReceiver):
 
         creation_time = self.t - self.e2e_prop_delay
         arrived_global_paths : set[int] = set()
-        
-        # Send feedback for each arrived packet
+
+        # ACK every arrival (see docstring: recoding makes each arrival a genuine
+        # delivery on its carried global path).
         for arrived_packet in self._e2e_arrivals_this_tick:
             global_path_id = arrived_packet.get_global_path()
             arrived_global_paths.add(global_path_id)
@@ -263,17 +271,11 @@ class SimReceiver(GeneralReceiver):
                 global_path_id=global_path_id,
                 creation_time=creation_time,
             )
-            # A DROPPED-typed arrival is an upstream-erasure marker => NACK it
-            # end-to-end; any other arrival is a genuine delivery => ACK.
-            if arrived_packet.get_type() == NodeRLNCType.DROPPED:
-                self.sim_print(f"E2E: sending NACK (DROPPED marker) for {related_packet_id}")
-                self._send_e2e_feedback_on_a_channel(global_path_id, FeedbackType.NACK, related_packet_id, None)
-            else:
-                self.sim_print(f"E2E: sending ACK for {related_packet_id}")
-                self._send_e2e_feedback_on_a_channel(
-                    global_path_id, FeedbackType.ACK, related_packet_id,
-                    arrived_packet.get_information_packets(),
-                )
+            self.sim_print(f"E2E: sending ACK for {related_packet_id}")
+            self._send_e2e_feedback_on_a_channel(
+                global_path_id, FeedbackType.ACK, related_packet_id,
+                arrived_packet.get_information_packets(),
+            )
 
         # NACK every global path that did not arrive this tick (erased on the last hop).
         for global_path_id in self.e2e_feedback_channels.keys():

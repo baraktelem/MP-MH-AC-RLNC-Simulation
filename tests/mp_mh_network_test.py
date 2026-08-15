@@ -481,13 +481,13 @@ def test_E2E1_feedback_roundtrip_timing():
 
 def test_E2E2_receiver_ack_vs_nack():
     """The SimReceiver in E2E mode emits exactly one end-to-end feedback per
-    global path each tick: ACK for a clean arrival, NACK for a DROPPED-typed
-    arrival (upstream erasure marker), and NACK for any global path that did not
-    arrive (erased on the last hop). Every feedback references
-    (carried global path, t - global_prop_delay). Feedback is label-complete
-    (one per global path) regardless of which physical path carried each label,
-    which is what keeps the source's per-(label, creation_time) bookkeeping
-    consistent once nodes re-run natural matching."""
+    global path each tick: ACK for every arrival (intermediate nodes recode, so an
+    arrival is always a genuine delivery on its carried global path) and NACK for
+    any global path that did not arrive (erased on the last hop). Every feedback
+    references (carried global path, t - global_prop_delay). Feedback is
+    label-complete (one per global path) regardless of which physical path carried
+    each label, which is what keeps the source's per-(label, creation_time)
+    bookkeeping consistent once nodes re-run natural matching."""
     NUM_PATHS = 4
     NUM_HOPS = 3
     PROP_DELAY = 6
@@ -500,15 +500,16 @@ def test_E2E2_receiver_ack_vs_nack():
     gpd = net.global_prop_delay
     receiver.t = gpd + 5  # past the warm-up guard so feedback is emitted
 
-    # This tick's arrivals: clean NEW carrying global path 1, DROPPED marker
-    # carrying global path 2. Global paths 3 and 4 did not arrive (erased).
-    clean_pkt = RLNCPacket(global_path_id=1, type=RLNCType.NEW,
-                           information_packets=[10, 11],
-                           prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
-    dropped_pkt = RLNCPacket(global_path_id=2, type=NodeRLNCType.DROPPED,
-                             information_packets=[12],
-                             prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
-    receiver._e2e_arrivals_this_tick = [clean_pkt, dropped_pkt]
+    # This tick's arrivals: a NEW carrying global path 1 and a recoded CORRECTION
+    # carrying global path 2 (a node filled that slot after an upstream drop).
+    # Global paths 3 and 4 did not arrive (erased on the last hop).
+    new_pkt = RLNCPacket(global_path_id=1, type=RLNCType.NEW,
+                         information_packets=[10, 11],
+                         prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
+    corr_pkt = RLNCPacket(global_path_id=2, type=NodeRLNCType.CORRECTION,
+                          information_packets=[12],
+                          prop_time_left_in_channel=0, creation_time=receiver.t - gpd)
+    receiver._e2e_arrivals_this_tick = [new_pkt, corr_pkt]
     receiver._send_e2e_feedbacks()
 
     def _last_on_channel(gp):
@@ -517,17 +518,12 @@ def test_E2E2_receiver_ack_vs_nack():
             f"Expected exactly one feedback on e2e channel {gp}, got {len(ch.packets_in_channel)}"
         return ch.packets_in_channel[-1]
 
-    # Clean arrival on global path 1 -> ACK
-    ack = _last_on_channel(1)
-    assert ack.is_ack(), f"Clean arrival should yield an ACK, got {ack.get_type()}"
-    assert ack.get_related_packet_id().get_creation_time() == receiver.t - gpd
-    assert ack.get_related_packet_id().get_global_path_id() == 1
-
-    # DROPPED-typed arrival on global path 2 -> NACK
-    nack2 = _last_on_channel(2)
-    assert nack2.is_nack(), f"DROPPED-typed arrival should yield a NACK, got {nack2.get_type()}"
-    assert nack2.get_related_packet_id().get_creation_time() == receiver.t - gpd
-    assert nack2.get_related_packet_id().get_global_path_id() == 2
+    # Both arrivals (NEW on global path 1, recoded CORRECTION on global path 2) -> ACK
+    for gp in (1, 2):
+        ack = _last_on_channel(gp)
+        assert ack.is_ack(), f"Arrival on global path {gp} should yield an ACK, got {ack.get_type()}"
+        assert ack.get_related_packet_id().get_creation_time() == receiver.t - gpd
+        assert ack.get_related_packet_id().get_global_path_id() == gp
 
     # Missing global paths 3 and 4 -> NACK each
     for gp in (3, 4):
@@ -536,48 +532,42 @@ def test_E2E2_receiver_ack_vs_nack():
         assert nack.get_related_packet_id().get_creation_time() == receiver.t - gpd
         assert nack.get_related_packet_id().get_global_path_id() == gp
 
-    print("  ACK on clean, NACK on DROPPED, NACK on missing labels - all correct")
+    print("  ACK on every arrival, NACK on missing labels - all correct")
     print("  PASSED")
 
 
 # ============================================================================
-# E2E3 - NodeSender propagates the DROPPED marker only in E2E mode
+# E2E3 - NodeSender recodes an upstream drop into a CORRECTION (both modes)
 # ============================================================================
 
-def test_E2E3_nodesender_dropped_marker():
-    """A NodeSender in E2E mode emits a NodeRLNCType.DROPPED-typed packet (still
-    filled from the correction buffer) when the matched global-path type is
-    DROPPED; in HBH mode the same situation yields a CORRECTION packet."""
+def test_E2E3_nodesender_recodes_dropped_as_correction():
+    """When the matched global-path type is DROPPED (nothing arrived on that global
+    path this tick because of an upstream erasure), the NodeSender recodes: it
+    re-sends the correction-buffer content as a normal CORRECTION packet, in BOTH
+    E2E and HBH modes. Nodes no longer propagate a DROPPED marker end-to-end, so a
+    per-hop drop is absorbed rather than forwarded (this keeps each global path at
+    its min-cut rate instead of the product of the per-hop erasures)."""
     NUM_PATHS = 4
     NUM_HOPS = 3
     PROP_DELAY = 6
 
-    print(f"\n=== Test E2E3: NodeSender DROPPED marker (E2E) vs CORRECTION (HBH) ===")
+    print(f"\n=== Test E2E3: NodeSender recodes DROPPED -> CORRECTION (E2E and HBH) ===")
 
-    # E2E: DROPPED type in -> DROPPED-typed packet out
-    net_e2e = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
-                                  feedback_source=FeedbackSource.E2E)
-    node_sender = net_e2e.nodes[0].my_sender
-    node_sender.correction_information_packets_buffer = {5, 6}
-    path = node_sender.paths[0]
-    pkt = node_sender.create_rlnc(path, NodeRLNCType.DROPPED)
-    assert pkt is not None, "DROPPED packet should be created when correction buffer is non-empty"
-    assert pkt.get_type() == NodeRLNCType.DROPPED, \
-        f"E2E NodeSender should emit DROPPED type, got {pkt.get_type()}"
-    assert set(pkt.get_information_packets()) == {5, 6}, \
-        "DROPPED packet must still carry correction-buffer content"
+    for feedback_source in (FeedbackSource.E2E, FeedbackSource.HBH):
+        net = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
+                                  feedback_source=feedback_source)
+        node_sender = net.nodes[0].my_sender
+        node_sender.correction_information_packets_buffer = {5, 6}
+        path = node_sender.paths[0]
+        pkt = node_sender.create_rlnc(path, NodeRLNCType.DROPPED)
+        assert pkt is not None, \
+            f"{feedback_source.name}: a packet should be created when the correction buffer is non-empty"
+        assert pkt.get_type() == NodeRLNCType.CORRECTION, \
+            f"{feedback_source.name} NodeSender should recode DROPPED into CORRECTION, got {pkt.get_type()}"
+        assert set(pkt.get_information_packets()) == {5, 6}, \
+            f"{feedback_source.name}: recoded packet must carry the correction-buffer content"
 
-    # HBH: DROPPED type in -> CORRECTION packet out (unchanged behavior)
-    net_hbh = _build_lossless_net(NUM_HOPS, NUM_PATHS, PROP_DELAY, num_packets=30,
-                                  feedback_source=FeedbackSource.HBH)
-    node_sender_hbh = net_hbh.nodes[0].my_sender
-    node_sender_hbh.correction_information_packets_buffer = {5, 6}
-    path_hbh = node_sender_hbh.paths[0]
-    pkt_hbh = node_sender_hbh.create_rlnc(path_hbh, NodeRLNCType.DROPPED)
-    assert pkt_hbh.get_type() == NodeRLNCType.CORRECTION, \
-        f"HBH NodeSender should emit CORRECTION type, got {pkt_hbh.get_type()}"
-
-    print("  E2E -> DROPPED, HBH -> CORRECTION")
+    print("  E2E -> CORRECTION, HBH -> CORRECTION (drop absorbed by recoding)")
     print("  PASSED")
 
 
@@ -730,7 +720,7 @@ def run_all_tests():
     test_MH7_timing_two_hops_lossless()
     test_E2E1_feedback_roundtrip_timing()
     test_E2E2_receiver_ack_vs_nack()
-    test_E2E3_nodesender_dropped_marker()
+    test_E2E3_nodesender_recodes_dropped_as_correction()
     test_E2E4_full_decode_lossless()
     test_E2E5_full_decode_light_loss()
     test_E2E6_last_node_receives_per_hop_feedback()

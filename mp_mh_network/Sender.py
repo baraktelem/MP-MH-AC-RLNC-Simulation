@@ -424,11 +424,18 @@ class SimSender(GeneralSender):
         acked_feedbacks = trimmed_acked_feedbacks
         self.sim_print(f"Infer_receiver_state: acked_feedbacks after trimming: {acked_feedbacks}")
         
-        # Move acked equations to acked_equations
+        # Move acked equations to acked_equations. A delayed ACK may reference an
+        # equation that is no longer waiting: its information packets were already
+        # decoded via other ACKs and the equation pruned below (or it was acked on
+        # an earlier tick). Such an ACK is redundant, so skip it instead of failing
+        # on a missing key -- mirroring the guarded NACK handling above.
         for ack in acked_feedbacks:
             self.sim_print(f"Infer_receiver_state: ACK detected: {ack}")
             related_equation = ack.get_related_packet_id()
-            self.acked_equations[related_equation] = self.equations_waiting_feedback.pop(related_equation)
+            if related_equation in self.equations_waiting_feedback:
+                self.acked_equations[related_equation] = self.equations_waiting_feedback.pop(related_equation)
+            else:
+                self.sim_print(f"Infer_receiver_state: ACK for already-resolved equation: {related_equation}")
         self.sim_print(f"Infer_receiver_state: equations_waiting_feedback after adding acked equations: {self.equations_waiting_feedback}")
         
         # Infer which equations can be decoded and decode them
@@ -794,14 +801,23 @@ class NodeSender(GeneralSender):
             information_packets = list(self.new_information_packets_buffer)
             rlnc_type_to_send = RLNCType.NEW
         else:
+            # Recoding: fill the slot from the correction buffer and send a normal
+            # CORRECTION packet, even when the slot is empty this tick because of an
+            # upstream (per-hop) erasure (rlnc_type == DROPPED). The node already
+            # holds the information in its buffer, so it re-sends a recoded packet
+            # instead of forwarding the erasure. This keeps each global path at its
+            # min-cut (bottleneck-hop) rate, matching the paper's recoding model.
+            #
+            # Previously (E2E only) an upstream drop was propagated end-to-end as a
+            # DROPPED-typed packet so the destination would NACK it. That models a
+            # network WITHOUT recoding: a global path is delivered only if every hop
+            # succeeds, so the source sees the product of the per-hop erasures
+            # (1-(1-eps)^H) instead of the bottleneck. The inflated erasure made the
+            # source's DoF gap (delta) explode, so it spent every path on FB-FEC
+            # retransmissions and stalled new-packet injection -- collapsing E2E
+            # throughput far below HBH, contrary to Fig. 19.
             information_packets = list(self.correction_information_packets_buffer)
-            # E2E only: propagate the upstream-erasure marker so it is observable
-            # end-to-end. The slot is still filled from the correction buffer, but
-            # typed DROPPED (instead of CORRECTION) so the far-end SimReceiver NACKs.
-            if self.feedback_source == FeedbackSource.E2E and rlnc_type == NodeRLNCType.DROPPED:
-                rlnc_type_to_send = NodeRLNCType.DROPPED
-            else:
-                rlnc_type_to_send = NodeRLNCType.CORRECTION
+            rlnc_type_to_send = NodeRLNCType.CORRECTION
         # Create RLNC only if packets had arrived
         if len(information_packets) > 0:
             rlnc_packet_to_send = RLNCPacket(
