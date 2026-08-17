@@ -1,8 +1,9 @@
+from copy import copy
+
 from Packet import RLNCPacket, FeedbackPacket, RLNCType, NodeRLNCType, FeedbackType, PacketID
 from Channels import Channel, ForwardChannel, Path
 from CodedEquation import CodedEquation
-from copy import copy
-
+from feedback_source import FeedbackSource
 
 class GeneralSenderPath(Path):
     def __init__(self, 
@@ -120,7 +121,7 @@ class SimSenderPath(GeneralSenderPath):
 class GeneralSender:
     def __init__(
         self,
-        rtt: int,
+        hop_rtt: int,
         paths: list[Path],
         init_paths: bool = False, # Default is False for SimSender
         initial_epsilon: float = 0.0,
@@ -130,7 +131,7 @@ class GeneralSender:
         self.debug = debug
 
         # Constants
-        self.rtt = rtt
+        self.hop_rtt = hop_rtt  # per-hop RTT (used by node senders; SimSender uses self.global_rtt)
         self.initial_epsilon = initial_epsilon
         if init_paths:
             self.paths : list[GeneralSenderPath] = [GeneralSenderPath(path, self, i, initial_epsilon) for i, path in enumerate(paths)]
@@ -199,7 +200,8 @@ class SimSender(GeneralSender):
     def __init__(
         self,
         num_of_packets_to_send: int,
-        rtt: int,
+        global_rtt: int,
+        hop_rtt: int,
         paths: list[Path],
         initial_epsilon: float = 0.0,
         max_allowed_overlap: int = None,
@@ -207,15 +209,23 @@ class SimSender(GeneralSender):
         network = None,
         next_hop : 'SimReceiver | Node' = None,
         debug: bool = False,
+        feedback_source: FeedbackSource = FeedbackSource.HBH, # Hop-by-hop or end-to-end feedback
+        e2e_feedback_channels: dict[int, Channel] = None,
         ):
-        super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
+        super().__init__(hop_rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
         # Sender constants
         self.unit_name = "SimSender"
+        self.global_rtt = global_rtt  # end-to-end RTT drives the a-priori window / overlap
         self.num_of_packets_to_send = num_of_packets_to_send
         self.paths = [SimSenderPath(path, self, i, initial_epsilon) for i, path in enumerate(paths)]
         self.num_of_paths = len(self.paths)
         self.my_network = network
         self.next_hop = next_hop
+        self.feedback_source = feedback_source
+        assert feedback_source in [FeedbackSource.HBH, FeedbackSource.E2E], f"Invalid feedback source: {feedback_source}"
+        if feedback_source == FeedbackSource.E2E:
+            assert e2e_feedback_channels is not None, "E2E feedback channels are required for end-to-end feedback"
+        self.e2e_feedback_channels = e2e_feedback_channels
 
         # Receiver state tracking
         self.acked_equations: dict[PacketID, CodedEquation] = {} # Acked equations
@@ -243,9 +253,9 @@ class SimSender(GeneralSender):
         self.delta = self.num_of_paths * ( self.d - 1 - self.threshold)
 
         # FEC parameters
-        self.EW = len(self.paths) * (rtt - 1) # End window of k=P*(RTT-1) new packets 
+        self.EW = len(self.paths) * (self.global_rtt - 1) # End window of k=P*(RTT-1) new packets 
         self.max_overlap_flag = False # Flag to indicate if max overlap has been reached
-        self.max_allowed_overlap = max_allowed_overlap if max_allowed_overlap is not None else 2 * rtt # Denoted as o_bar in the paper
+        self.max_allowed_overlap = max_allowed_overlap if max_allowed_overlap is not None else 2 * self.global_rtt # Denoted as o_bar in the paper
         # self.feedbacks : list[FeedbackPacket] = [] # Feedback packets from all paths at current time
         self.oldest_information_packet_on_air = 1 # Last information packet sent- for max overlap
         self.newest_information_packet_on_air = 0 # Newest information packet sent- for max overlap
@@ -368,9 +378,9 @@ class SimSender(GeneralSender):
     
     def init_fec_transmissions(self):
         if self.is_EW():
-            # set mp for all paths after k = num_of_paths * (rtt - 1) transmissions
+            # set mp for all paths after k = num_of_paths * (global_rtt - 1) transmissions
             for path in self.paths:
-                path.mp = round(path.epsilon_est * (self.rtt - 1)) # Round to nearest integer
+                path.mp = round(path.epsilon_est * (self.global_rtt - 1)) # Round to nearest integer
             # start FEC for all remaining paths
             paths_for_init_fec = list(self.remaining_paths_for_transmission)  # Copy the list
             for path in paths_for_init_fec:
@@ -388,7 +398,7 @@ class SimSender(GeneralSender):
         self.sim_print(f"Infer_receiver_state: nack_feedbacks: {nack_feedbacks}")
         for nack in nack_feedbacks:
             related_equation = nack.get_related_packet_id()
-            # Only pop if equation exists (may have been cleaned up already)
+            # Delete if equation exists (may have been cleaned up already)
             if related_equation in self.equations_waiting_feedback:
                 self.equations_waiting_feedback.pop(related_equation)
             else:
@@ -414,11 +424,18 @@ class SimSender(GeneralSender):
         acked_feedbacks = trimmed_acked_feedbacks
         self.sim_print(f"Infer_receiver_state: acked_feedbacks after trimming: {acked_feedbacks}")
         
-        # Move acked equations to acked_equations
+        # Move acked equations to acked_equations. A delayed ACK may reference an
+        # equation that is no longer waiting: its information packets were already
+        # decoded via other ACKs and the equation pruned below (or it was acked on
+        # an earlier tick). Such an ACK is redundant, so skip it instead of failing
+        # on a missing key -- mirroring the guarded NACK handling above.
         for ack in acked_feedbacks:
             self.sim_print(f"Infer_receiver_state: ACK detected: {ack}")
             related_equation = ack.get_related_packet_id()
-            self.acked_equations[related_equation] = self.equations_waiting_feedback.pop(related_equation)
+            if related_equation in self.equations_waiting_feedback:
+                self.acked_equations[related_equation] = self.equations_waiting_feedback.pop(related_equation)
+            else:
+                self.sim_print(f"Infer_receiver_state: ACK for already-resolved equation: {related_equation}")
         self.sim_print(f"Infer_receiver_state: equations_waiting_feedback after adding acked equations: {self.equations_waiting_feedback}")
         
         # Infer which equations can be decoded and decode them
@@ -469,11 +486,55 @@ class SimSender(GeneralSender):
         return False
     
     def get_feedbacks_from_all_paths(self):
-        super().get_feedbacks_from_all_paths()
+        # HBH: step each per-hop path feedback channel (base behavior).
+        # E2E: step the dedicated end-to-end feedback channels instead and route
+        # each arrived feedback back into the matching SimSenderPath so its
+        # epsilon/r estimation reflects end-to-end erasure.
+        if self.feedback_source == FeedbackSource.E2E:
+            self.get_e2e_feedbacks_from_all_paths()
+        else:
+            super().get_feedbacks_from_all_paths()
         acks = [ack for ack in self.feedbacks if ack.is_ack()]
         nacks = [nack for nack in self.feedbacks if nack.is_nack()]
         self.acked_feedback_history.extend(copy(acks))
         self.nacked_feedback_history.extend(copy(nacks))
+
+    def get_e2e_feedbacks_from_all_paths(self):
+        """End-to-end feedback: 
+        1. Read the per-global-path e2e channels
+        2. Feed each arrived feedback into the SimSenderPath with marching global_path_index -
+            mirroring GeneralSenderPath.run_feedback_channel_step bookkeeping so
+            update_path_params keeps epsilon_est/r current
+        3. Populate self.feedbacks for the shared AC-RLNC machinery."""
+        self.feedbacks = []  # Clear feedbacks from previous step
+        # Clear per-path current feedbacks (some paths get nothing this tick)
+        for path in self.paths:
+            path.current_feedbacks = []
+
+        paths_by_global_index = {path.get_global_path_index(): path for path in self.paths}
+        for global_path_idx, channel in self.e2e_feedback_channels.items():
+            # Get feedbacks from the e2e channel
+            channel.run_step()
+            arrived_feedbacks = channel.pop_arrived_packets()
+            if not arrived_feedbacks:
+                continue
+            # Match e2e feedback to path by global path
+            path = paths_by_global_index.get(global_path_idx)
+            assert path is not None, \
+                f"No SimSenderPath for global path {global_path_idx}; have {list(paths_by_global_index.keys())}"
+            # Route feedback into the path's accounting (same as run_feedback_channel_step)
+            path.current_feedbacks = list(arrived_feedbacks)
+            path.all_feedback_history.extend(copy(arrived_feedbacks))
+            path.acked_feedback_history.extend([fb for fb in arrived_feedbacks if fb.type == FeedbackType.ACK])
+            path.nacked_feedback_history.extend([fb for fb in arrived_feedbacks if fb.type == FeedbackType.NACK])
+            path.update_path_params()
+            # Drop feedbacks on packets that weren't sent (at the end of simulation)
+            valid_feedbacks = [
+                fb for fb in arrived_feedbacks
+                if fb.get_related_packet_id().get_creation_time() <= self.latest_rlnc_packet_on_air.get_creation_time()
+            ]
+            self.feedbacks.extend(valid_feedbacks)
+        self.all_feedback_history.extend(copy(self.feedbacks))
 
     def update_sim_sender_params(self):
         self.update_rlnc_id_depended_on_undecoded_information_packets()
@@ -653,13 +714,11 @@ class SimSender(GeneralSender):
     def get_all_rlnc_history(self) -> list[RLNCPacket]:
         return self.sent_new_rlnc_history + self.sent_fec_history + self.sent_fb_fec_history
 
-    # def sim_print(self, message: str):
-    #     pass
-
     def __repr__(self):
         s = "SimSender:"
         s += f"\n  num_of_packets_to_send: {self.num_of_packets_to_send}"
-        s += f"\n  rtt: {self.rtt}"
+        s += f"\n  global_rtt: {self.global_rtt}"
+        s += f"\n  hop_rtt: {self.hop_rtt}"
         s += f"\n  num paths: {self.num_of_paths}"
         s += f"\n  initial epsilon: {self.initial_epsilon}"
         s += f"\n  my receiver: {self.unit_name}"
@@ -673,20 +732,22 @@ class SimSender(GeneralSender):
 class NodeSender(GeneralSender):
     def __init__(
         self,
-        rtt: int,
+        hop_rtt: int,
         hop_num: int,
         paths: list[Path],
         initial_epsilon: float = 0.0,
         unit_name: str=None,
         parent_node: 'Node'=None,
         debug: bool = False,
+        feedback_source: FeedbackSource = FeedbackSource.HBH,
         ):
         # Constants
         if unit_name is None: # Set unit name before calling super() for setting name that is not "GeneralReceiver"
             unit_name = f"NodeSender[{hop_num}]"
         self.unit_name = unit_name
-        super().__init__(rtt, paths, init_paths=True, initial_epsilon=initial_epsilon, debug=debug)
+        super().__init__(hop_rtt, paths, init_paths=True, initial_epsilon=initial_epsilon, debug=debug)
         self.hop_num = hop_num
+        self.feedback_source = feedback_source
 
         # Network
         self.parent_node = parent_node
@@ -740,8 +801,23 @@ class NodeSender(GeneralSender):
             information_packets = list(self.new_information_packets_buffer)
             rlnc_type_to_send = RLNCType.NEW
         else:
-            rlnc_type_to_send = NodeRLNCType.CORRECTION
+            # Recoding: fill the slot from the correction buffer and send a normal
+            # CORRECTION packet, even when the slot is empty this tick because of an
+            # upstream (per-hop) erasure (rlnc_type == DROPPED). The node already
+            # holds the information in its buffer, so it re-sends a recoded packet
+            # instead of forwarding the erasure. This keeps each global path at its
+            # min-cut (bottleneck-hop) rate, matching the paper's recoding model.
+            #
+            # Previously (E2E only) an upstream drop was propagated end-to-end as a
+            # DROPPED-typed packet so the destination would NACK it. That models a
+            # network WITHOUT recoding: a global path is delivered only if every hop
+            # succeeds, so the source sees the product of the per-hop erasures
+            # (1-(1-eps)^H) instead of the bottleneck. The inflated erasure made the
+            # source's DoF gap (delta) explode, so it spent every path on FB-FEC
+            # retransmissions and stalled new-packet injection -- collapsing E2E
+            # throughput far below HBH, contrary to Fig. 19.
             information_packets = list(self.correction_information_packets_buffer)
+            rlnc_type_to_send = NodeRLNCType.CORRECTION
         # Create RLNC only if packets had arrived
         if len(information_packets) > 0:
             rlnc_packet_to_send = RLNCPacket(

@@ -49,7 +49,6 @@ class Packet:
         self.creation_time = creation_time
         self.arrival_times: dict[str, int] = {}
         self.type = type
-        # self.id = PacketID(global_path_id, creation_time, type)
         self.id = PacketID(global_path_id, creation_time)
     
     def record_arrival_at(self, component_name: str, arrival_time: int):

@@ -33,7 +33,7 @@ sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "jamming_simulation"))
 
-from mp_mh_network.Network import Network
+from mp_mh_network.Network import MhNetwork
 from mp_mh_network.Node import Node
 from mp_mh_network.Receiver import SimReceiver
 from mp_mh_network.Sender import SimSender
@@ -42,13 +42,13 @@ from JamChannels import JamPath
 from Jammer import Jammer
 
 
-class JamMpMhNetwork(Network):
+class JamMpMhNetwork(MhNetwork):
     """Multi-hop multipath network of P parallel single-path chains plus a Jammer.
 
-    Sibling of MpMhNetwork (inherits Network for stats / SimulationStats /
-    collect_stats infrastructure). Does NOT inherit MpMhNetwork because the
-    natural-matching update_natural_matching hook does not apply here: chain
-    identity is fixed by physical wiring, not by per-step path ranking.
+    Sibling of MpMhNetwork (both inherit MhNetwork for the shared per-hop RTT
+    split plus Network's stats infrastructure). Does NOT inherit MpMhNetwork
+    because the natural-matching update_natural_matching hook does not apply
+    here: chain identity is fixed by physical wiring, not by per-step path ranking.
     """
 
     def __init__(
@@ -58,7 +58,7 @@ class JamMpMhNetwork(Network):
         max_iterations: int = None,
         num_packets_to_send: int = None,
         num_paths: int = 4,
-        prop_delay: int = 6,
+        global_prop_delay: int = 6,
         threshold: float = 0.0,
         max_allowed_overlap: int = None,
         num_hops: int = 3,
@@ -72,12 +72,13 @@ class JamMpMhNetwork(Network):
             max_iterations,
             num_packets_to_send,
             num_paths,
-            prop_delay,
+            global_prop_delay,
             threshold,
             max_allowed_overlap,
+            num_hops,
             debug,
         )
-        assert num_hops >= 1, f"num_hops must be >= 1, got {num_hops}"
+        # num_hops / num_nodes / hop_rtt / hop_prop_delay come from MhNetwork.
         assert num_paths >= 1, f"num_paths must be >= 1, got {num_paths}"
         assert len(path_epsilons) == num_paths, (
             f"path_epsilons must be chain-major with len == num_paths "
@@ -89,16 +90,12 @@ class JamMpMhNetwork(Network):
                 f"got {len(chain_eps)}"
             )
 
-        self.num_hops = num_hops
-        self.num_nodes = num_hops - 1
-        self.num_paths = num_paths
-
         self.paths: list[list[JamPath]] = [[] for _ in range(num_paths)]
         self._build_paths()
 
         self.receiver = SimReceiver(
             input_paths=self._paths_at_hop(num_hops - 1),
-            rtt=self.rtt,
+            hop_rtt=self.hop_rtt,
             unit_name="SimReceiver",
             debug=self.debug,
         )
@@ -111,7 +108,8 @@ class JamMpMhNetwork(Network):
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
         self.sender = SimSender(
             num_of_packets_to_send=self.num_packets_to_send,
-            rtt=self.rtt,
+            global_rtt=self.global_rtt,
+            hop_rtt=self.hop_rtt,
             paths=self._paths_at_hop(0),
             initial_epsilon=init_eps,
             max_allowed_overlap=max_allowed_overlap,
@@ -124,7 +122,7 @@ class JamMpMhNetwork(Network):
         all_paths = [p for chain in self.paths for p in chain]
         self.jammer = Jammer(
             paths=all_paths,
-            rtt=self.rtt,
+            rtt=self.global_rtt,
             alpha=jammer_alpha,
             k=jammer_k,
             parent_network=self,
@@ -136,7 +134,7 @@ class JamMpMhNetwork(Network):
         for c in range(self.num_paths):
             for h in range(self.num_hops):
                 jpath = JamPath(
-                    propagation_delay=self.prop_delay,
+                    propagation_delay=self.hop_prop_delay,
                     epsilon=self.path_epsilons[c][h],
                     hop_index=h,
                     path_index_in_hop=c,
@@ -152,7 +150,7 @@ class JamMpMhNetwork(Network):
                     hop_num=h + 1,
                     input_paths=[self.paths[c][h]],
                     output_paths=[self.paths[c][h + 1]],
-                    rtt=self.rtt,
+                    hop_rtt=self.hop_rtt,
                     unit_name=f"Node[c={c},h={h}]",
                     next_hop=None,
                     Network=self,
