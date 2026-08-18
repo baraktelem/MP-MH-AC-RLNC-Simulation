@@ -74,7 +74,7 @@ def run_sr_mpmh(
         max_iterations=max_iterations,
         num_packets_to_send=num_packets_to_send,
         num_paths=num_paths,
-        prop_delay=rtt // 2,
+        global_prop_delay=rtt // 2,  # rtt is the end-to-end RTT; split across hops
         num_hops=num_hops,
         window=window,
     )

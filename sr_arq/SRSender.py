@@ -174,7 +174,7 @@ class SRSender(GeneralSender):
     def __repr__(self) -> str:
         s = "SRSender:"
         s += f"\n  num_of_packets_to_send: {self.num_of_packets_to_send}"
-        s += f"\n  rtt: {self.rtt}"
+        s += f"\n  rtt: {self.hop_rtt}"
         s += f"\n  num paths: {self.num_of_paths}"
         s += f"\n  next_new_seq: {self.next_new_seq}"
         s += f"\n  num delivered (to next hop): {len(self.acked_seqs)}"
@@ -204,6 +204,10 @@ class SRSimSender(SRSender):
                 f"packets_per_path must be > 0, got {packets_per_path}"
             )
         self.packets_per_path: int | None = packets_per_path
+        # Fixed-horizon simulations close source admission at the measurement
+        # boundary, then keep running retransmissions while the admitted cohort
+        # drains through the network.
+        self.admission_closed: bool = False
         self.path_admitted_count: dict[int, int] = {i: 0 for i in range(P)}
         # Per-path next new seq (round-robin slice) and per-path retransmit set.
         self.path_next_new_seq: dict[int, int] = {i: i + 1 for i in range(P)}
@@ -215,6 +219,10 @@ class SRSimSender(SRSender):
         self.gid_to_index: dict[int, int] = {
             p.get_global_path_index(): i for i, p in enumerate(self.paths)
         }
+
+    def close_admission(self) -> None:
+        """Stop admitting new packets while preserving retransmissions."""
+        self.admission_closed = True
 
     def _process_feedbacks(self):
         # ACKs first: clear the owning path's retransmit set.
@@ -256,6 +264,8 @@ class SRSimSender(SRSender):
             seq = min(self.path_retransmit[i])
             self.path_retransmit[i].discard(seq)
             return seq
+        if self.admission_closed:
+            return None
         # Equal per-path quota: stop admitting new seqs once this chain has
         # used its allowance (retransmits above still allowed).
         if (

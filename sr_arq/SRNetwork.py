@@ -6,7 +6,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 
-from mp_mh_network.Network import Network
+from mp_mh_network.Network import Network, MhNetwork
 from mp_mh_network.Channels import Path
 
 from sr_arq.SRReceiver import SRReceiver, SRSimReceiver
@@ -70,7 +70,7 @@ class SRNetwork(Network):
         # Units
         self.receiver = SRReceiver(
             input_paths=self.paths,
-            rtt=self.rtt,
+            rtt=self.global_rtt,
             unit_name="SRReceiver",
             debug=self.debug,
         )
@@ -78,7 +78,7 @@ class SRNetwork(Network):
         sender_cls = SRSimSender if independent else SRSender
         self.sender = sender_cls(
             num_of_packets_to_send=self.num_packets_to_send,
-            rtt=self.rtt,
+            rtt=self.global_rtt,
             paths=self.paths,
             initial_epsilon=init_eps,
             window=window,
@@ -87,7 +87,7 @@ class SRNetwork(Network):
         )
 
 
-class SRMpMhNetwork(Network):
+class SRMpMhNetwork(MhNetwork):
     """Multi-hop multipath SR-ARQ network: P independent chains of H hops.
 
     Sibling of JamMpMhNetwork (same P-chain topology and explicit tick order),
@@ -108,11 +108,19 @@ class SRMpMhNetwork(Network):
     becomes packets_per_path * num_paths. Retransmits are unaffected. Works
     independently of max_iterations (either or both may be set).
 
-    Throughput is total in-order delivery over the common measurement interval.
-    D_mean/D_max are delivery time minus source first-transmission time over the
-    completed packet cohort. H=1 reduces to the single-hop decoupled model.
+    Throughput uses sum(delivered_c / finish_time_c) when equal per-chain packet
+    quotas run to completion. If max_iterations binds first, throughput is
+    total in-order delivery at that common horizon divided by the horizon; new
+    source admission then closes and the admitted cohort drains for uncensored
+    D_mean/D_max. H=1 reduces to the single-hop decoupled model.
 
     path_epsilons is chain-major: path_epsilons[c][h].
+
+    RTT model (global, like MpMhNetwork): global_prop_delay is the END-TO-END
+    one-way delay. MhNetwork splits it across the hops into hop_prop_delay
+    (= global_prop_delay // num_hops) and hop_rtt (= global_rtt // num_hops), so
+    the end-to-end delay is fixed regardless of num_hops. Each hop's Path uses
+    hop_prop_delay and every per-hop unit uses hop_rtt.
     """
 
     def __init__(
@@ -122,12 +130,13 @@ class SRMpMhNetwork(Network):
         max_iterations: int = None,
         num_packets_to_send: int = None,
         num_paths: int = 4,
-        prop_delay: int = 10,
+        global_prop_delay: int = 6,
         threshold: float = 0.0,            # unused by SR; accepted for API parity
         max_allowed_overlap: int = None,   # unused by SR; accepted for API parity
         num_hops: int = 3,
         window: int = None,
         in_order_forwarding: bool = False,
+        node_queue_size: int = None,
         packets_per_path: int = None,
         debug: bool = False,
     ):
@@ -137,19 +146,29 @@ class SRMpMhNetwork(Network):
                 f"packets_per_path must be > 0, got {packets_per_path}"
             )
             num_packets_to_send = packets_per_path * num_paths
+        # MhNetwork splits the end-to-end global_prop_delay / global_rtt across the
+        # hops into self.hop_prop_delay and self.hop_rtt (per-hop quantities),
+        # exactly like MpMhNetwork -- this is the "global RTT" model.
         super().__init__(
             path_epsilons,
             initial_epsilon,
             max_iterations,
             num_packets_to_send,
             num_paths,
-            prop_delay,
+            global_prop_delay,
             threshold,
             max_allowed_overlap,
+            num_hops,
             debug,
         )
         self.packets_per_path = packets_per_path
-        assert num_hops >= 1, f"num_hops must be >= 1, got {num_hops}"
+        # Set only when max_iterations is the binding stop condition. Throughput
+        # is snapshotted at this common horizon; the admitted cohort is then
+        # drained for uncensored delay statistics.
+        self.measurement_horizon: int | None = None
+        self.delivered_at_horizon: int | None = None
+        self.admitted_at_horizon: frozenset[int] = frozenset()
+        self.drain_slots: int = 0
         assert len(path_epsilons) == num_paths, (
             f"path_epsilons must be chain-major with num_paths ({num_paths}) rows, got {len(path_epsilons)}"
         )
@@ -158,22 +177,19 @@ class SRMpMhNetwork(Network):
                 f"path_epsilons[{c}] must have num_hops ({num_hops}) entries, got {len(chain)}"
             )
 
-        self.num_hops = num_hops
-        self.num_nodes = num_hops - 1
-
         # Paths: paths[c][h], each chain uses the same global path index (c+1) at
         # every hop, so a packet's chain is recoverable from its global_path_id.
         self.paths: list[list[Path]] = [[] for _ in range(num_paths)]
         for c in range(num_paths):
             for h in range(num_hops):
-                path = Path(prop_delay, path_epsilons[c][h], h, c, debug=self.debug)
+                path = Path(self.hop_prop_delay, path_epsilons[c][h], h, c, debug=self.debug)
                 path.set_global_path_index(c + 1)
                 self.paths[c].append(path)
 
         # Receiver on the last hop of every chain (decoupled per-chain in-order).
         self.receiver = SRSimReceiver(
             input_paths=[self.paths[c][num_hops - 1] for c in range(num_paths)],
-            rtt=self.rtt,
+            rtt=self.hop_rtt,
             num_chains=num_paths,
             unit_name="SRSimReceiver",
             debug=self.debug,
@@ -187,11 +203,12 @@ class SRMpMhNetwork(Network):
                     hop_num=h + 1,
                     input_path=self.paths[c][h],
                     output_path=self.paths[c][h + 1],
-                    rtt=self.rtt,
+                    rtt=self.hop_rtt,
                     unit_name=f"SRNode[c={c},h={h}]",
                     window=window,
                     num_chains=num_paths,
                     in_order_forwarding=in_order_forwarding,
+                    node_queue_size=node_queue_size,
                     debug=self.debug,
                 )
 
@@ -199,7 +216,7 @@ class SRMpMhNetwork(Network):
         init_eps = initial_epsilon if initial_epsilon is not None else 0.0
         self.sender = SRSimSender(
             num_of_packets_to_send=self.num_packets_to_send,
-            rtt=self.rtt,
+            rtt=self.hop_rtt,
             paths=[self.paths[c][0] for c in range(num_paths)],
             initial_epsilon=init_eps,
             window=window,
@@ -218,11 +235,33 @@ class SRMpMhNetwork(Network):
 
     def run_sim(self):
         if self.max_iterations is not None:
+            completed_target = False
             for t in range(1, self.max_iterations + 1):
                 self.t = t
                 self._tick()
                 if len(self.receiver.information_packets_decoding_times) >= self.num_packets_to_send:
+                    completed_target = True
                     break
+
+            # If the common horizon bound first, snapshot throughput there,
+            # close only NEW source admission, and drain every packet already
+            # admitted. Retransmissions and relay forwarding continue normally.
+            if not completed_target:
+                self.measurement_horizon = self.t
+                self.delivered_at_horizon = len(
+                    self.receiver.information_packets_decoding_times
+                )
+                self.admitted_at_horizon = frozenset(
+                    self.sender.inforamtion_packets_first_transmission_times
+                )
+                self.sender.close_admission()
+
+                while not self.admitted_at_horizon.issubset(
+                    self.receiver.information_packets_decoding_times
+                ):
+                    self.t += 1
+                    self._tick()
+                self.drain_slots = self.t - self.measurement_horizon
         else:
             while len(self.receiver.information_packets_decoding_times) < self.num_packets_to_send:
                 self.t += 1
@@ -231,8 +270,18 @@ class SRMpMhNetwork(Network):
         # print(f"Simulation completed at t={self.t}")
 
     def calculate_normalized_throughput_stats(self):
+        if self.measurement_horizon is not None:
+            # Fixed-horizon streaming mode: all chains share one wall-clock
+            # denominator. Packets delivered during the post-horizon drain are
+            # deliberately excluded from throughput.
+            self.normalized_throughput = (
+                self.delivered_at_horizon / self.measurement_horizon
+            )
+            return
+
         # Decoupled: sum of per-chain rates (delivered_c / chain_finish_time_c),
-        # so a slow/jammed chain does not drag down the good ones.
+        # used when finite per-chain packet quotas run to completion. A
+        # slow/jammed chain does not add artificial idle time to good chains.
         tp = 0.0
         for gid, cnt in self.receiver.chain_delivered_count.items():
             tc = self.receiver.chain_finish_time.get(gid, 0)

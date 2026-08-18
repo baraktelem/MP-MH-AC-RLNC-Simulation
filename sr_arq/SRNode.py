@@ -30,6 +30,16 @@ class SRNodeReceiver(GeneralReceiver):
       per-hop head-of-line blocking (higher delay), matching the paper's
       "full SR-ARQ protocol at each node".
 
+    Flow control (`node_queue_size`): the number of packets this node may still
+    be holding -- received but not yet ACKed by the next hop, INCLUDING packets
+    parked in the in-order reorder buffer. When that held backlog is full, a new
+    arrival is refused (a NACK is sent instead of an ACK) so the upstream keeps
+    the packet and retransmits it later -- i.e. hop-by-hop backpressure that stops
+    the source from outrunning a downstream bottleneck. A slot frees only when the
+    next hop ACKs the packet (true store-and-forward buffer). `node_queue_size=None`
+    is an unbounded buffer (no backpressure); the node then behaves like a plain
+    GeneralReceiver.
+
     This node handles a single chain; its seqs stride by `num_chains` and its
     first seq equals the input path's global_path_index (the chain id).
     """
@@ -40,6 +50,7 @@ class SRNodeReceiver(GeneralReceiver):
         rtt: int,
         num_chains: int = 1,
         in_order_forwarding: bool = False,
+        node_queue_size: int = None,
         unit_name: str = None,
         debug: bool = False,
     ):
@@ -56,6 +67,55 @@ class SRNodeReceiver(GeneralReceiver):
         self._stride = num_chains
         self._expected = input_paths[0].get_global_path_index()
         self._reorder_buffer: set[int] = set()
+
+        # Flow control: bounded receive buffer (None = unbounded, no backpressure).
+        self.node_queue_size = node_queue_size
+        # Reference to the node sender's `acked_seqs` set (seqs the NEXT hop has
+        # ACKed), wired by SRNode so the held (received-but-not-yet-ACKed) backlog
+        # can be measured. Only used when node_queue_size is set.
+        self._peer_acked: set[int] | None = None
+
+    def run_step(self, time: int = None):
+        # With an unbounded buffer, behave exactly like the base receiver.
+        if self.node_queue_size is None:
+            return super().run_step(time)
+        # Bounded buffer: refuse a new arrival (NACK instead of ACK) whenever the
+        # held backlog (reorder-buffered + received-but-not-yet-next-hop-ACKed) is
+        # full, so the upstream retransmits it once room frees up. This is the
+        # hop-by-hop backpressure.
+        if time is not None:
+            self.t = time
+        else:
+            self.t += 1
+        self.arrived_packet = None
+        for receiver_path in self.receiver_paths:
+            arrived_packets = receiver_path.pop_arrived_packets()
+            assert arrived_packets is None or len(arrived_packets) <= 1, (
+                f"Only 1 packet can be in receiver path buffer, got {arrived_packets}"
+            )
+            if not arrived_packets:
+                self.send_nack(receiver_path)
+                continue
+            pkt = arrived_packets[0]
+            seq = pkt.get_information_packets()[0]
+            acked = self._peer_acked if self._peer_acked is not None else set()
+            # Total packets still held: reorder-buffered (in-order mode) plus
+            # released-but-not-yet-next-hop-ACKed. A slot frees only on next-hop ACK.
+            backlog = len(self._reorder_buffer) + len(self.received_seqs) - len(acked)
+            # Always accept duplicates/already-released seqs (so the upstream stops
+            # retransmitting), AND the head-of-line seq == _expected even when full:
+            # once the reorder buffer counts toward the cap, refusing the very seq
+            # the node is waiting for would deadlock it. Only genuinely new seqs
+            # past the in-order frontier are throttled.
+            duplicate = (seq in self.received_seqs) or (self.in_order_forwarding and seq <= self._expected)
+            if backlog >= self.node_queue_size and not duplicate:
+                self.send_nack(receiver_path)  # backpressure: looks like a loss upstream
+                continue
+            self.arrived_packet = pkt
+            self.received_rlnc_channel_history.append(pkt)
+            receiver_path.update_receiving_packets_strating_time(pkt, self.t)
+            self.send_ack(receiver_path, pkt)
+            self._after_rlnc_arrived(receiver_path, pkt)
 
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         seq = arrived_packet.get_information_packets()[0]
@@ -169,6 +229,7 @@ class SRNode:
         window: int = None,
         num_chains: int = 1,
         in_order_forwarding: bool = False,
+        node_queue_size: int = None,
         debug: bool = False,
     ):
         self.hop_num = hop_num
@@ -182,6 +243,7 @@ class SRNode:
             rtt=rtt,
             num_chains=num_chains,
             in_order_forwarding=in_order_forwarding,
+            node_queue_size=node_queue_size,
             unit_name=f"{self.unit_name}.Receiver",
             debug=debug,
         )
@@ -194,6 +256,9 @@ class SRNode:
             window=window,
             debug=debug,
         )
+        # Let the receiver measure its held backlog (received but not yet ACKed by
+        # the next hop) for flow control -- a slot frees only on the next-hop ACK.
+        self.my_receiver._peer_acked = self.my_sender.acked_seqs
 
     def run_step(self, time: int = None):
         # Receive (and ACK/NACK upstream) first, then forward downstream.

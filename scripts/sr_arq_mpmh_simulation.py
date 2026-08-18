@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import numpy as np
 
@@ -93,16 +93,18 @@ def _run_srmpmh(
     window: int | None,
     in_order_forwarding: bool = False,
     packets_per_path: int | None = None,
+    node_queue_size: int | None = None,
 ) -> SimulationStats:
     net = SRMpMhNetwork(
         path_epsilons=matrix,
         num_paths=num_paths,
         num_hops=len(matrix[0]),
-        prop_delay=rtt // 2,
+        global_prop_delay=rtt // 2,  # rtt is the end-to-end RTT; split across hops
         num_packets_to_send=num_packets_to_send,
         max_iterations=max_iterations,
         window=window,
         in_order_forwarding=in_order_forwarding,
+        node_queue_size=node_queue_size,
         packets_per_path=packets_per_path,
     )
     net.run_sim()
@@ -112,24 +114,24 @@ def _run_srmpmh(
 def run_best_single(
     e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
-    packets_per_path: int | None = None,
+    packets_per_path: int | None = None, node_queue_size: int | None = None,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
     return _run_srmpmh(
         best_single_path(E), 1, rtt, num_packets_to_send, max_iterations, window,
-        in_order_forwarding, packets_per_path=packets_per_path,
+        in_order_forwarding, packets_per_path=packets_per_path, node_queue_size=node_queue_size,
     )
 
 
 def run_matched(
     e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
-    packets_per_path: int | None = None,
+    packets_per_path: int | None = None, node_queue_size: int | None = None,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
     return _run_srmpmh(
         natural_matched(E), NUM_PATHS, rtt, num_packets_to_send, max_iterations, window,
-        in_order_forwarding, packets_per_path=packets_per_path,
+        in_order_forwarding, packets_per_path=packets_per_path, node_queue_size=node_queue_size,
     )
 
 
@@ -139,20 +141,20 @@ def run_matched(
 
 def _run_one(args: tuple) -> tuple:
     (setting, e1, e2, rtt, num_packets_to_send, max_iterations, window,
-     in_order_forwarding, packets_per_path) = args
+     in_order_forwarding, packets_per_path, node_queue_size) = args
     if setting == "best":
         stats = run_best_single(
             e1, e2, rtt=rtt, num_packets_to_send=num_packets_to_send,
             max_iterations=max_iterations, window=window,
             in_order_forwarding=in_order_forwarding,
-            packets_per_path=packets_per_path,
+            packets_per_path=packets_per_path, node_queue_size=node_queue_size,
         )
     else:
         stats = run_matched(
             e1, e2, rtt=rtt, num_packets_to_send=num_packets_to_send,
             max_iterations=max_iterations, window=window,
             in_order_forwarding=in_order_forwarding,
-            packets_per_path=packets_per_path,
+            packets_per_path=packets_per_path, node_queue_size=node_queue_size,
         )
     return (setting, float(e1), float(e2), stats)
 
@@ -163,13 +165,36 @@ def _execute(tasks: list[tuple], parallel_workers: int):
     if parallel_workers is None or parallel_workers <= 1:
         for idx, task in enumerate(tasks, start=1):
             yield idx, total, _run_one(task)
-    else:
-        with ProcessPoolExecutor(max_workers=parallel_workers) as pool:
-            fut_to_idx = {pool.submit(_run_one, t): i for i, t in enumerate(tasks, start=1)}
-            done = 0
-            for fut in as_completed(fut_to_idx):
+        return
+
+    # Manage the pool manually so Ctrl+C stops promptly. Using
+    # `with ProcessPoolExecutor(...)` blocks in shutdown(wait=True) on exit, and
+    # an untimed as_completed()/Event.wait() suppresses KeyboardInterrupt
+    # delivery on Windows. Polling with a short timeout lets the main thread
+    # raise the pending interrupt and reach the handler, which cancels queued
+    # work and terminates the worker processes.
+    pool = ProcessPoolExecutor(max_workers=parallel_workers)
+    futures: list = []
+    try:
+        futures = [pool.submit(_run_one, t) for t in tasks]
+        pending = set(futures)
+        done = 0
+        while pending:
+            finished, pending = wait(
+                pending, timeout=0.5, return_when=FIRST_COMPLETED
+            )
+            for fut in finished:
                 done += 1
                 yield done, total, fut.result()
+    except (KeyboardInterrupt, GeneratorExit):
+        print("\n[INTERRUPTED] Cancelling pending simulations and terminating workers...")
+        for f in futures:
+            f.cancel()
+        for proc in list(getattr(pool, "_processes", {}).values()):
+            proc.terminate()
+        raise
+    finally:
+        pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -182,42 +207,61 @@ def _run_main() -> None:
     print("=" * 70)
 
     # ---- Paper MP-MH setting ---------------------------------------------
-    RTT_LOCAL = RTT / NUM_HOPS                                   
-    # SR_WINDOW = RTT_LOCAL - 1                          # per-chain sliding window
-    SR_WINDOW  = 2 * (RTT_LOCAL - 1)
     EPS_VALUES = [round(float(v), 2) for v in np.arange(0.1, 0.9, 0.1)]  # eps1, eps2 in [0.1, 0.8]
+
+    HOP_RTT = RTT // NUM_HOPS                                   
+    # RTT is the end-to-end (global) round-trip; SRMpMhNetwork/MhNetwork splits it
+    # across the H hops. The per-hop RTT (HOP_RTT = RTT / H) drives the window.
+    SR_WINDOW  = 2 * (HOP_RTT - 1)
+    # SR_WINDOW = None
 
     NUM_ITERATIONS = 150
     # Equal new-packet quota per chain (None = unlimited). When set, each chain
     # admits exactly this many new seqs; global delivery target becomes P * N
     # (or 1 * N for the best single-path setting).
-    PACKETS_PER_PATH = 1000
+    PACKETS_PER_PATH = None
+    # Optional hard time stop (None = run until all quota packets are delivered).
+    MAX_ITERATIONS = 2000
     # Legacy global packet target; ignored when PACKETS_PER_PATH is set.
     NUM_PACKETS_TO_SEND = None
-    # Optional hard time stop (None = run until all quota packets are delivered).
-    MAX_ITERATIONS = None
-
     # Node forwarding discipline: False = out-of-order relay (efficient, low delay);
     # True = full SR-ARQ at each node (in-order forwarding, per-hop HOL blocking,
     # higher delay - matches the paper's "full SR-ARQ protocol at each node").
-    IN_ORDER_FORWARDING = False
+    IN_ORDER_FORWARDING = True
+    # Per-relay flow-control buffer: max received-but-not-forwarded seqs a node
+    # may hold before it applies backpressure (refuses new arrivals so the
+    # upstream retransmits later). None = unbounded (no backpressure); a finite
+    # value bounds the bottleneck queue and makes the in-order delay stationary.
+    NODE_QUEUE_SIZE = 2 * HOP_RTT
+
     PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
     LOAD_EXISTING = False
     # Keep the complete-cohort (post-horizon drain) experiment separate from
     # the earlier hard-cutoff results, whose delays were right-censored.
-    RESULTS_FILE = f"sr_arq_mpmh_results_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT_LOCAL}.pkl"
-    PLOT_FILE = f"sr_arq_mpmh_compare_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT_LOCAL}.png"
+    if PACKETS_PER_PATH is not None:
+        RESULTS_FILE = f"sr_arq_mpmh_results_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
+    elif MAX_ITERATIONS is not None:
+        RESULTS_FILE = f"sr_arq_mpmh_results_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
+    else:
+        RESULTS_FILE = f"sr_arq_mpmh_results_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
 
     SETTINGS = ["best", "matched"]
 
     print("\nParameters:")
-    print(f"  P={NUM_PATHS}, H={NUM_HOPS}, RTT={RTT_LOCAL}, window={SR_WINDOW}")
+    print(f"  P={NUM_PATHS}, H={NUM_HOPS}, RTT={RTT} (hop_rtt={HOP_RTT}), window={SR_WINDOW}, node_queue_size={NODE_QUEUE_SIZE}")
     print(f"  eps1, eps2 grid: {EPS_VALUES}")
     print(f"  packets_per_path={PACKETS_PER_PATH}, max_iterations={MAX_ITERATIONS}")
     print(f"  num_packets_to_send={NUM_PACKETS_TO_SEND} (legacy; unused if packets_per_path set)")
     print(f"  iterations={NUM_ITERATIONS}, in_order_forwarding={IN_ORDER_FORWARDING}, "
           f"workers={PARALLEL_WORKERS}")
+    print(f"  node queue size={NODE_QUEUE_SIZE}")
+    print(f"\nresults file:\n{RESULTS_FILE}")
+    print(f"\nplot file:\n{PLOT_FILE}")
+    print("(saved only when all simulations are done)")
 
     if LOAD_EXISTING and os.path.exists(RESULTS_FILE):
         results_by_setting = load_pickle(RESULTS_FILE)
@@ -228,9 +272,9 @@ def _run_main() -> None:
                 for e1 in EPS_VALUES:
                     for e2 in EPS_VALUES:
                         tasks.append((
-                            setting, e1, e2, RTT_LOCAL, NUM_PACKETS_TO_SEND,
+                            setting, e1, e2, RTT, NUM_PACKETS_TO_SEND,
                             MAX_ITERATIONS, SR_WINDOW, IN_ORDER_FORWARDING,
-                            PACKETS_PER_PATH,
+                            PACKETS_PER_PATH, NODE_QUEUE_SIZE,
                         ))
 
         results_by_setting: dict[str, list[tuple[float, float, SimulationStats]]] = {
@@ -253,22 +297,24 @@ def _run_main() -> None:
     if results_by_setting.get("matched"):
         series.append((MATCHED_LABEL, aggregate(results_by_setting["matched"]), "tab:blue"))
 
-    horizon_label = (
-        f"horizon={MAX_ITERATIONS}" if MAX_ITERATIONS is not None else "no horizon"
+    max_iterations_label = (
+        f"max iterations={MAX_ITERATIONS}"
     )
     quota_label = (
         f"packets/path={PACKETS_PER_PATH}"
         if PACKETS_PER_PATH is not None
-        else f"packets={NUM_PACKETS_TO_SEND}"
+        else f"num packets={NUM_PACKETS_TO_SEND}"
     )
     plot_compare(
         series,
         EPS_VALUES,
         EPS_VALUES,
         title_suffix=(
-            f"SR-ARQ MP-MH hop-by-hop (paper Fig. 19 lower); "
-            f"H={NUM_HOPS}, P={NUM_PATHS}, RTT={RTT_LOCAL}, W={SR_WINDOW}; "
-            f"{quota_label}, {horizon_label}; {NUM_ITERATIONS} realizations"
+            f"SR-ARQ MP-MH hop-by-hop; "
+            f"H={NUM_HOPS}, P={NUM_PATHS}, RTT={RTT}, W={SR_WINDOW}; "
+            f"{quota_label}, {max_iterations_label}; {NUM_ITERATIONS} realizations; "
+            f"in order forwarding={IN_ORDER_FORWARDING}; "
+            f"node queue size={NODE_QUEUE_SIZE}"
         ),
         plot_path=PLOT_FILE,
         std_for=MATCHED_LABEL,
@@ -277,4 +323,12 @@ def _run_main() -> None:
 
 
 if __name__ == "__main__":
-    _run_main()
+    try:
+        _run_main()
+    except KeyboardInterrupt:
+        # Workers are already terminated in _execute; force-exit to skip the
+        # concurrent.futures atexit join, which can otherwise hang on Windows.
+        print("\n[ABORTED] Interrupted by user (Ctrl+C).")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)
