@@ -232,7 +232,7 @@ def _run_main() -> None:
     # may hold before it applies backpressure (refuses new arrivals so the
     # upstream retransmits later). None = unbounded (no backpressure); a finite
     # value bounds the bottleneck queue and makes the in-order delay stationary.
-    NODE_QUEUE_SIZE = 2 * HOP_RTT
+    NODE_QUEUE_SIZE = 256
 
     PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
