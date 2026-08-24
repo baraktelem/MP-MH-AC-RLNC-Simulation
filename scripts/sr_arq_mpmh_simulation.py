@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
 from mp_mh_network.Network import SimulationStats
 from sr_arq.SRNetwork import SRMpMhNetwork
+from sr_arq.sr_feedback import SRFeedbackMode
 
 # Reuse the generic aggregation / plotting / pickle helpers from the MP driver.
 from sr_arq_simulation import aggregate, plot_compare, save_pickle, load_pickle
@@ -94,6 +95,7 @@ def _run_srmpmh(
     in_order_forwarding: bool = False,
     packets_per_path: int | None = None,
     node_queue_size: int | None = None,
+    feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
 ) -> SimulationStats:
     net = SRMpMhNetwork(
         path_epsilons=matrix,
@@ -106,6 +108,7 @@ def _run_srmpmh(
         in_order_forwarding=in_order_forwarding,
         node_queue_size=node_queue_size,
         packets_per_path=packets_per_path,
+        feedback_mode=feedback_mode,
     )
     net.run_sim()
     return net.get_simulation_stats()
@@ -115,11 +118,13 @@ def run_best_single(
     e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
     packets_per_path: int | None = None, node_queue_size: int | None = None,
+    feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
     return _run_srmpmh(
         best_single_path(E), 1, rtt, num_packets_to_send, max_iterations, window,
         in_order_forwarding, packets_per_path=packets_per_path, node_queue_size=node_queue_size,
+        feedback_mode=feedback_mode,
     )
 
 
@@ -127,11 +132,13 @@ def run_matched(
     e1: float, e2: float, *, rtt: int, num_packets_to_send: int | None,
     max_iterations: int | None, window: int | None, in_order_forwarding: bool = False,
     packets_per_path: int | None = None, node_queue_size: int | None = None,
+    feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
 ) -> SimulationStats:
     E = paper_eps_matrix(e1, e2)
     return _run_srmpmh(
         natural_matched(E), NUM_PATHS, rtt, num_packets_to_send, max_iterations, window,
         in_order_forwarding, packets_per_path=packets_per_path, node_queue_size=node_queue_size,
+        feedback_mode=feedback_mode,
     )
 
 
@@ -141,13 +148,14 @@ def run_matched(
 
 def _run_one(args: tuple) -> tuple:
     (setting, e1, e2, rtt, num_packets_to_send, max_iterations, window,
-     in_order_forwarding, packets_per_path, node_queue_size) = args
+     in_order_forwarding, packets_per_path, node_queue_size, feedback_mode) = args
     if setting == "best":
         stats = run_best_single(
             e1, e2, rtt=rtt, num_packets_to_send=num_packets_to_send,
             max_iterations=max_iterations, window=window,
             in_order_forwarding=in_order_forwarding,
             packets_per_path=packets_per_path, node_queue_size=node_queue_size,
+            feedback_mode=feedback_mode,
         )
     else:
         stats = run_matched(
@@ -155,6 +163,7 @@ def _run_one(args: tuple) -> tuple:
             max_iterations=max_iterations, window=window,
             in_order_forwarding=in_order_forwarding,
             packets_per_path=packets_per_path, node_queue_size=node_queue_size,
+            feedback_mode=feedback_mode,
         )
     return (setting, float(e1), float(e2), stats)
 
@@ -211,9 +220,24 @@ def _run_main() -> None:
 
     HOP_RTT = RTT // NUM_HOPS                                   
     # RTT is the end-to-end (global) round-trip; SRMpMhNetwork/MhNetwork splits it
-    # across the H hops. The per-hop RTT (HOP_RTT = RTT / H) drives the window.
-    SR_WINDOW  = 2 * (HOP_RTT - 1)
-    # SR_WINDOW = None
+    # across the H hops. The per-hop RTT (HOP_RTT = RTT / H) drives the HBH window.
+
+    # Feedback / relay mode:
+    #   SRFeedbackMode.HBH              -> hop-by-hop (paper Fig. 19 bottom; the default)
+    #   SRFeedbackMode.E2E_FORWARD_ONLY -> forward-only relays, slot-based E2E (paper Fig. 19 top)
+    #   SRFeedbackMode.E2E_FULL_ARQ     -> full per-hop SR-ARQ relays, seq-based E2E (mp_mh-style)
+    SR_FEEDBACK_MODE = SRFeedbackMode.E2E_FORWARD_ONLY
+    _FB_TAG = SR_FEEDBACK_MODE.name  # keeps HBH / E2E outputs from colliding
+
+    # Window sizing. HBH runs an independent SR-ARQ per hop, so the per-hop RTT
+    # drives the window. Both E2E modes run the SR-ARQ end-to-end at the source, so
+    # the per-chain window must span a full end-to-end RTT; a per-hop window would
+    # stall each chain for a full RTT per end-to-end ACK and crush throughput.
+    # if SR_FEEDBACK_MODE.is_e2e():
+    #     SR_WINDOW = 2 * (RTT - 1)
+    # else:
+    #     SR_WINDOW = 2 * (HOP_RTT - 1)
+    SR_WINDOW = 2 * (HOP_RTT - 1)
 
     NUM_ITERATIONS = 150
     # Equal new-packet quota per chain (None = unlimited). When set, each chain
@@ -240,18 +264,19 @@ def _run_main() -> None:
     # Keep the complete-cohort (post-horizon drain) experiment separate from
     # the earlier hard-cutoff results, whose delays were right-censored.
     if PACKETS_PER_PATH is not None:
-        RESULTS_FILE = f"sr_arq_mpmh_results_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
-        PLOT_FILE = f"sr_arq_mpmh_compare_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
+        RESULTS_FILE = f"sr_arq_mpmh_results_{_FB_TAG}_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_{_FB_TAG}_packets_per_path_{PACKETS_PER_PATH}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
     elif MAX_ITERATIONS is not None:
-        RESULTS_FILE = f"sr_arq_mpmh_results_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
-        PLOT_FILE = f"sr_arq_mpmh_compare_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
+        RESULTS_FILE = f"sr_arq_mpmh_results_{_FB_TAG}_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_{_FB_TAG}_max_iterations_{MAX_ITERATIONS}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
     else:
-        RESULTS_FILE = f"sr_arq_mpmh_results_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
-        PLOT_FILE = f"sr_arq_mpmh_compare_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
+        RESULTS_FILE = f"sr_arq_mpmh_results_{_FB_TAG}_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
+        PLOT_FILE = f"sr_arq_mpmh_compare_{_FB_TAG}_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
 
-    SETTINGS = ["best", "matched"]
+    SETTINGS = ["best", "matched"] if not SR_FEEDBACK_MODE.is_e2e() else ["matched"]
 
     print("\nParameters:")
+    print(f"  feedback_mode={SR_FEEDBACK_MODE.name}")
     print(f"  P={NUM_PATHS}, H={NUM_HOPS}, RTT={RTT} (hop_rtt={HOP_RTT}), window={SR_WINDOW}, node_queue_size={NODE_QUEUE_SIZE}")
     print(f"  eps1, eps2 grid: {EPS_VALUES}")
     print(f"  packets_per_path={PACKETS_PER_PATH}, max_iterations={MAX_ITERATIONS}")
@@ -274,7 +299,7 @@ def _run_main() -> None:
                         tasks.append((
                             setting, e1, e2, RTT, NUM_PACKETS_TO_SEND,
                             MAX_ITERATIONS, SR_WINDOW, IN_ORDER_FORWARDING,
-                            PACKETS_PER_PATH, NODE_QUEUE_SIZE,
+                            PACKETS_PER_PATH, NODE_QUEUE_SIZE, SR_FEEDBACK_MODE,
                         ))
 
         results_by_setting: dict[str, list[tuple[float, float, SimulationStats]]] = {
@@ -310,7 +335,7 @@ def _run_main() -> None:
         EPS_VALUES,
         EPS_VALUES,
         title_suffix=(
-            f"SR-ARQ MP-MH hop-by-hop; "
+            f"SR-ARQ MP-MH [{_FB_TAG}]; "
             f"H={NUM_HOPS}, P={NUM_PATHS}, RTT={RTT}, W={SR_WINDOW}; "
             f"{quota_label}, {max_iterations_label}; {NUM_ITERATIONS} realizations; "
             f"in order forwarding={IN_ORDER_FORWARDING}; "

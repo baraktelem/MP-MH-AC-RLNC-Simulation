@@ -13,6 +13,8 @@ in `sr_arq/`.
 
 ## Architecture
 
+- `sr_arq/sr_feedback.py` - `SRFeedbackMode` leaf enum: `HBH`, `E2E_FORWARD_ONLY`,
+  `E2E_FULL_ARQ` (see "Feedback modes" below).
 - `sr_arq/SRPacket.py` - `DataPacket` (uncoded; one info packet = its `seq`) and `SRType`.
 - `sr_arq/SRSender.py`
   - `SRSender`: shared multipath - one global seq stream striped across all P
@@ -36,7 +38,42 @@ in `sr_arq/`.
   - `SRMpMhNetwork`: multi-hop, P independent chains of H hops, one `SRNode` per
     (chain, hop); source on hop 0, `SRSimReceiver` on the last hop; explicit
     per-slot tick (source -> nodes hop-major -> receiver). Options: `window`,
-    `in_order_forwarding`. H=1 reduces to the single-hop decoupled model.
+    `in_order_forwarding`, `node_queue_size`, `feedback_mode`. H=1 reduces to the
+    single-hop decoupled model (all three feedback modes coincide there).
+
+## Feedback modes (`feedback_mode` on `SRMpMhNetwork`, default `HBH`)
+
+The `SRFeedbackMode` picks where the source gets feedback and what the relays do.
+Both E2E modes build one dedicated per-chain end-to-end `Channel` (full end-to-end
+one-way delay) carrying feedback straight from the receiver to the source; the
+source then reads those channels instead of the hop-0 path channels
+(`SRSender.get_feedbacks_from_all_paths`).
+
+- `HBH` (paper Fig. 19 bottom, default): source hears the first node; every
+  `SRNode` runs full per-hop SR-ARQ. Per-path rate = min-cut (bottleneck hop).
+- `E2E_FORWARD_ONLY` (paper Fig. 19 top): intermediate nodes are best-effort
+  forwarders (`SRNode.run_step` forwards each arrival once, no per-hop
+  retransmit/feedback). The forward delay is deterministic, so the receiver uses
+  **slot-based** end-to-end feedback (`SRSimReceiver._send_e2e_feedbacks_slot`):
+  one feedback per chain per tick, ACK for a delivered chain, NACK (creation_time
+  = `t - e2e_prop_delay`) otherwise; the source resolves the NACK slot -> seq. A
+  packet is delivered only if it survives all H hops -> per-path rate = product of
+  per-hop rates. `in_order_forwarding` / `node_queue_size` are inactive here.
+- `E2E_FULL_ARQ` (mirrors the `mp_mh` AC-RLNC E2E structure): intermediate nodes
+  run the full per-hop SR-ARQ, identical to HBH; the only change vs HBH is that
+  the source hears only the receiver. Per-hop ARQ makes the delay variable, so the
+  receiver uses **seq-based selective-repeat** feedback
+  (`SRSimReceiver._send_e2e_feedbacks_seq`): ACK the seqs actually received, NACK
+  genuine per-chain gaps (a seq below the highest received that has not arrived).
+  The source retransmits a seq only when overdue (last sent >= `global_rtt` ago),
+  which paces retransmission to once per end-to-end RTT and also serves as the tail
+  backstop for the last packet of a chain (which has no higher seq to reveal it as
+  a gap). Per-path rate sits between `E2E_FORWARD_ONLY` (product) and `HBH`
+  (min-cut); extra delay comes from recovering first-hop losses over a full RTT.
+
+Both E2E modes run the SR-ARQ end-to-end at the source, so the sliding `window`
+must be sized on the end-to-end RTT (the driver uses `2*(RTT-1)`), not the per-hop
+RTT used for HBH.
 
 ## Key protocol rules
 
@@ -65,11 +102,14 @@ in `sr_arq/`.
 - `scripts/sr_arq_simulation.py` - single-hop MP setting (Fig. 11: P=4, RTT=20,
   eps_3=0.2, eps_4=0.8, eps_1/eps_2 in [0.1,0.8]). Pick protocols via `protos`
   in `_run_main`: `"sr"`, `"sr_indep"`, `"sr_perpath"`, `"sr_mpmh"`, `"ac"`.
-- `scripts/sr_arq_mpmh_simulation.py` - MP-MH setting (Fig. 19 lower graph: H=3,
-  P=4, RTT=12, the paper's 4x3 epsilon matrix) in two settings: `best` (single
-  global path from the best path of each hop) and `matched` (P natural-matched
-  global paths). Knobs: `IN_ORDER_FORWARDING`, `SR_WINDOW`, `NUM_PACKETS_TO_SEND`,
-  `NUM_ITERATIONS`.
+- `scripts/sr_arq_mpmh_simulation.py` - MP-MH setting (H=3, P=4, RTT=12, the
+  paper's 4x3 epsilon matrix) in two settings: `best` (single global path from the
+  best path of each hop) and `matched` (P natural-matched global paths). Knobs:
+  `SR_FEEDBACK_MODE`, `IN_ORDER_FORWARDING`, `SR_WINDOW`, `NUM_PACKETS_TO_SEND`,
+  `NUM_ITERATIONS`. `SR_FEEDBACK_MODE=HBH` -> Fig. 19 lower graph;
+  `E2E_FORWARD_ONLY` (matched) -> Fig. 19 upper graph; `E2E_FULL_ARQ` is the extra
+  mp_mh-style variant. The window auto-switches to the end-to-end RTT for E2E, and
+  outputs are tagged with the mode so HBH/E2E runs never collide.
 - `LOAD_EXISTING=True` replots from the pickle without re-running. Runs are heavy
   (grid x 150 iters x 4 chains); reduce iterations for a quick check.
 
@@ -82,6 +122,12 @@ in `sr_arq/`.
 - MP-MH paper script with both Fig. 19 settings (best single path, P matched).
 - Sliding window; NACK-driven retransmission; out-of-order (default) and
   in-order (option) node forwarding.
+- End-to-end feedback in two variants alongside HBH (`feedback_mode`): Type A
+  `E2E_FORWARD_ONLY` (forward-only relays, slot-based E2E; Fig. 19 top; per-path
+  rate = product of hop rates) and Type B `E2E_FULL_ARQ` (full per-hop SR-ARQ
+  relays, seq-based selective-repeat E2E; mp_mh-style). Smoke check on a lossy
+  4x3 grid: throughput HBH > E2E_FULL_ARQ > E2E_FORWARD_ONLY and delay in the
+  reverse order, as the paper predicts. Tests in `tests/test_sr_arq_e2e.py`.
 - MP-MH matched is close to the paper's targets (mean ~25x, max ~84x the genie
   bound `RTT/2 + 1/(1-eps_bar)`), matching well at high loss (eps=0.8: mean 283
   vs 233, max 697 vs 784).

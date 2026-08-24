@@ -10,6 +10,7 @@ from mp_mh_network.Packet import RLNCPacket
 from mp_mh_network.Channels import Path
 
 from sr_arq.SRSender import SRSender
+from sr_arq.sr_feedback import SRFeedbackMode
 
 
 class SRNodeReceiver(GeneralReceiver):
@@ -52,11 +53,16 @@ class SRNodeReceiver(GeneralReceiver):
         in_order_forwarding: bool = False,
         node_queue_size: int = None,
         unit_name: str = None,
+        feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
     ):
         if unit_name is None:
             unit_name = "SRNodeReceiver"
         super().__init__(input_paths, rtt, unit_name, debug=debug)
+        # E2E_FORWARD_ONLY turns the relay into a best-effort forwarder: this
+        # receiver just captures the arrival with no upstream ACK/NACK. HBH and
+        # E2E_FULL_ARQ both run the full per-hop SR-ARQ below.
+        self.feedback_mode = feedback_mode
         self.in_order_forwarding = in_order_forwarding
         # Seqs made forwardable to the node's sender (out-of-order: all arrivals;
         # in-order: only the contiguously-released prefix).
@@ -76,6 +82,25 @@ class SRNodeReceiver(GeneralReceiver):
         self._peer_acked: set[int] | None = None
 
     def run_step(self, time: int = None):
+        # E2E_FORWARD_ONLY: best-effort relay input -- capture this tick's single
+        # arrival with NO upstream feedback and NO received_seqs bookkeeping (the
+        # node forwards the raw arrival immediately; see SRNode.run_step).
+        if self.feedback_mode == SRFeedbackMode.E2E_FORWARD_ONLY:
+            if time is not None:
+                self.t = time
+            else:
+                self.t += 1
+            self.arrived_packet = None
+            for receiver_path in self.receiver_paths:
+                arrived_packets = receiver_path.pop_arrived_packets()
+                assert arrived_packets is None or len(arrived_packets) <= 1, (
+                    f"Only 1 packet can be in receiver path buffer, got {arrived_packets}"
+                )
+                if arrived_packets:
+                    self.arrived_packet = arrived_packets[0]
+                    self.received_rlnc_channel_history.append(self.arrived_packet)
+                    receiver_path.update_receiving_packets_strating_time(self.arrived_packet, self.t)
+            return
         # With an unbounded buffer, behave exactly like the base receiver.
         if self.node_queue_size is None:
             return super().run_step(time)
@@ -230,6 +255,7 @@ class SRNode:
         num_chains: int = 1,
         in_order_forwarding: bool = False,
         node_queue_size: int = None,
+        feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
     ):
         self.hop_num = hop_num
@@ -237,6 +263,7 @@ class SRNode:
         self.rtt = rtt
         self.input_path = input_path
         self.output_path = output_path
+        self.feedback_mode = feedback_mode
 
         self.my_receiver = SRNodeReceiver(
             input_paths=[input_path],
@@ -245,8 +272,12 @@ class SRNode:
             in_order_forwarding=in_order_forwarding,
             node_queue_size=node_queue_size,
             unit_name=f"{self.unit_name}.Receiver",
+            feedback_mode=feedback_mode,
             debug=debug,
         )
+        # The sender stays a full SR-ARQ output link (HBH default). In
+        # E2E_FORWARD_ONLY it is used only as a plain transmitter (run_step is not
+        # called; SRNode.run_step forwards via _send_seq_on_path directly).
         self.my_sender = SRNodeSender(
             output_path=output_path,
             node_receiver=self.my_receiver,
@@ -261,7 +292,23 @@ class SRNode:
         self.my_receiver._peer_acked = self.my_sender.acked_seqs
 
     def run_step(self, time: int = None):
-        # Receive (and ACK/NACK upstream) first, then forward downstream.
+        # E2E_FORWARD_ONLY: best-effort store-and-forward. Take this tick's arrival
+        # (no upstream feedback) and forward it once on the output path, re-stamping
+        # the chain's global id and a fresh creation_time. Duplicates ARE re-forwarded
+        # so that source retransmissions propagate. No per-hop retransmit queue/window.
+        if self.feedback_mode == SRFeedbackMode.E2E_FORWARD_ONLY:
+            self.my_receiver.run_step(time)
+            self.my_sender.t = self.my_receiver.t
+            out_path = self.my_sender.paths[0]
+            if self.my_receiver.arrived_packet is not None:
+                seq = self.my_receiver.arrived_packet.get_information_packets()[0]
+                self.my_sender._send_seq_on_path(out_path, seq)
+            else:
+                # Nothing to forward: still advance the output forward channel so
+                # in-flight packets keep propagating.
+                out_path.run_forward_channel_step(current_time=self.my_sender.t)
+            return
+        # HBH and E2E_FULL_ARQ: full per-hop SR-ARQ (receive+ACK/NACK, then forward).
         self.my_receiver.run_step(time)
         self.my_sender.run_step(time)
 

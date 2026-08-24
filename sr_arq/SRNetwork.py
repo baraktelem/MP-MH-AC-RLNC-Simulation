@@ -7,11 +7,12 @@ sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 
 from mp_mh_network.Network import Network, MhNetwork
-from mp_mh_network.Channels import Path
+from mp_mh_network.Channels import Path, Channel
 
 from sr_arq.SRReceiver import SRReceiver, SRSimReceiver
 from sr_arq.SRSender import SRSender, SRSimSender
 from sr_arq.SRNode import SRNode
+from sr_arq.sr_feedback import SRFeedbackMode
 
 
 class SRNetwork(Network):
@@ -138,6 +139,7 @@ class SRMpMhNetwork(MhNetwork):
         in_order_forwarding: bool = False,
         node_queue_size: int = None,
         packets_per_path: int = None,
+        feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
     ):
         # Equal per-path quota implies a global delivery target of P * N.
@@ -162,6 +164,15 @@ class SRMpMhNetwork(MhNetwork):
             debug,
         )
         self.packets_per_path = packets_per_path
+        # Feedback / relay mode (HBH default; two E2E variants). In both E2E modes
+        # the source's feedback comes end-to-end from the receiver over dedicated
+        # per-chain channels; the relay behaviour differs (see SRFeedbackMode).
+        assert feedback_mode in (
+            SRFeedbackMode.HBH,
+            SRFeedbackMode.E2E_FORWARD_ONLY,
+            SRFeedbackMode.E2E_FULL_ARQ,
+        ), f"Invalid feedback mode: {feedback_mode}"
+        self.feedback_mode = feedback_mode
         # Set only when max_iterations is the binding stop condition. Throughput
         # is snapshotted at this common horizon; the admitted cohort is then
         # drained for uncensored delay statistics.
@@ -186,12 +197,32 @@ class SRMpMhNetwork(MhNetwork):
                 path.set_global_path_index(c + 1)
                 self.paths[c].append(path)
 
+        # End-to-end feedback channels: one dedicated channel per chain (global
+        # path), carrying ACK/NACKs straight from the receiver to the source with
+        # the full end-to-end one-way delay. Built for both E2E variants.
+        self.e2e_feedback_channels: dict[int, Channel] = {}
+        if self.feedback_mode.is_e2e():
+            for c in range(num_paths):
+                gid = c + 1
+                channel = Channel(
+                    self.global_prop_delay,
+                    hop_index=0,
+                    path_index_in_hop=c,
+                    name_prefix=f"E2E[{gid}].",
+                    debug=self.debug,
+                )
+                channel.set_global_path_index(gid)
+                self.e2e_feedback_channels[gid] = channel
+
         # Receiver on the last hop of every chain (decoupled per-chain in-order).
         self.receiver = SRSimReceiver(
             input_paths=[self.paths[c][num_hops - 1] for c in range(num_paths)],
             rtt=self.hop_rtt,
             num_chains=num_paths,
             unit_name="SRSimReceiver",
+            feedback_mode=self.feedback_mode,
+            e2e_feedback_channels=self.e2e_feedback_channels,
+            e2e_prop_delay=self.global_prop_delay,
             debug=self.debug,
         )
 
@@ -209,6 +240,7 @@ class SRMpMhNetwork(MhNetwork):
                     num_chains=num_paths,
                     in_order_forwarding=in_order_forwarding,
                     node_queue_size=node_queue_size,
+                    feedback_mode=self.feedback_mode,
                     debug=self.debug,
                 )
 
@@ -222,6 +254,9 @@ class SRMpMhNetwork(MhNetwork):
             window=window,
             packets_per_path=packets_per_path,
             next_hop=None,
+            feedback_mode=self.feedback_mode,
+            e2e_feedback_channels=self.e2e_feedback_channels,
+            e2e_rtt=self.global_rtt,
             debug=self.debug,
         )
 

@@ -1,15 +1,17 @@
 import sys
 import os
+from copy import copy
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 
 from mp_mh_network.Sender import GeneralSender, GeneralSenderPath
-from mp_mh_network.Channels import Path
+from mp_mh_network.Channels import Path, Channel
 from mp_mh_network.Packet import RLNCPacket
 
 from sr_arq.SRPacket import DataPacket
+from sr_arq.sr_feedback import SRFeedbackMode
 
 
 class SRSenderPath(GeneralSenderPath):
@@ -54,12 +56,33 @@ class SRSender(GeneralSender):
         initial_epsilon: float = 0.0,
         window: int = None,
         next_hop=None,
+        feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
+        e2e_feedback_channels: dict[int, Channel] = None,
+        e2e_rtt: int = None,
         debug: bool = False,
     ):
         super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
         self.unit_name = "SRSender"
         self.num_of_packets_to_send = num_of_packets_to_send
         self.next_hop = next_hop
+
+        # Feedback mode. In both E2E modes the source reads its feedback from the
+        # dedicated per-chain end-to-end channels instead of the hop-0 path
+        # channels; HBH (default) keeps the original first-node feedback.
+        self.feedback_mode = feedback_mode
+        self.e2e_feedback_channels = e2e_feedback_channels
+        # End-to-end round trip (= 2 * global_prop_delay). Used only by the
+        # E2E_FULL_ARQ retransmission pacing / tail backstop.
+        self.e2e_rtt = e2e_rtt
+        if feedback_mode.is_e2e():
+            assert e2e_feedback_channels is not None, \
+                "E2E feedback channels are required for an end-to-end feedback mode"
+        if feedback_mode == SRFeedbackMode.E2E_FULL_ARQ:
+            assert e2e_rtt is not None, \
+                "e2e_rtt is required for E2E_FULL_ARQ (retransmission pacing / tail backstop)"
+        # slot at which each seq was last (re)transmitted on the forward channel;
+        # used by E2E_FULL_ARQ to rate-limit retransmission to once per e2e RTT.
+        self.last_send_slot: dict[int, int] = {}
 
         # Sliding-window flow control (NOT reliability; reliability is NACK-driven).
         # A NEW seq may only be sent while it lies within [send_base, send_base+window),
@@ -99,6 +122,23 @@ class SRSender(GeneralSender):
         # guarded cascade only fires if used in a simple single-hop wiring.
         if hasattr(self.next_hop, "run_step"):
             self.next_hop.run_step()
+
+    def get_feedbacks_from_all_paths(self):
+        # HBH: read the per-hop (hop-0) path feedback channels (base behaviour).
+        # E2E (both variants): read the dedicated per-chain end-to-end feedback
+        # channels instead, so the source's retransmission is driven by the
+        # receiver rather than the first node. Each channel is stepped exactly once
+        # per tick here (the receiver only adds to it), mirroring mp_mh's
+        # get_e2e_feedbacks_from_all_paths so the round trip is the end-to-end RTT.
+        if not self.feedback_mode.is_e2e():
+            return super().get_feedbacks_from_all_paths()
+        self.feedbacks = []
+        for channel in self.e2e_feedback_channels.values():
+            channel.run_step()
+            arrived = channel.pop_arrived_packets()
+            if arrived:
+                self.feedbacks.extend(arrived)
+        self.all_feedback_history.extend(copy(self.feedbacks))
 
     def _process_feedbacks(self):
         # ACKs first: mark delivered and clear any pending retransmit.
@@ -163,6 +203,8 @@ class SRSender(GeneralSender):
         # new_transmission_updates, and updates latest_rlnc_packet_on_air.
         self.send_packet(path, packet)
         path.record_sent_seq(self.t, seq)
+        # Last (re)transmission slot per seq, for E2E_FULL_ARQ retransmission pacing.
+        self.last_send_slot[seq] = self.t
         self.sim_print(f"sent seq {seq} on path {path.get_global_path_index()} at slot {self.t}")
 
     def new_transmission_updates(self, packet):
@@ -225,6 +267,12 @@ class SRSimSender(SRSender):
         self.admission_closed = True
 
     def _process_feedbacks(self):
+        # E2E_FULL_ARQ uses seq-based selective-repeat feedback (the receiver names
+        # the missing seq); HBH and E2E_FORWARD_ONLY use slot-based feedback (the
+        # NACK's creation_time resolves to a seq via the path's slot->seq record).
+        if self.feedback_mode == SRFeedbackMode.E2E_FULL_ARQ:
+            self._process_feedbacks_seq()
+            return
         # ACKs first: clear the owning path's retransmit set.
         for fb in self.feedbacks:
             if fb.is_ack():
@@ -248,6 +296,59 @@ class SRSimSender(SRSender):
                 seq = path.resolve_seq(creation_time)
                 if seq is not None and seq not in self.acked_seqs:
                     self.path_retransmit[i].add(seq)
+
+    def _process_feedbacks_seq(self):
+        """E2E_FULL_ARQ: seq-based selective-repeat feedback from the receiver.
+
+        The relay chain (node1..receiver) is reliable per-hop; the only lossy link
+        from the source's point of view is source->node1, whose losses can only be
+        learned end-to-end (a full RTT later). So retransmission is rate-limited to
+        once per end-to-end RTT per seq (via last_send_slot), which is both the
+        fastest possible reaction and what keeps a merely-delayed in-flight packet
+        from being re-sent.
+        """
+        # ACKs first (each carries the delivered seq directly).
+        for fb in self.feedbacks:
+            if fb.is_ack():
+                i = self.gid_to_index.get(fb.get_global_path())
+                for seq in (fb.get_related_information_packets() or []):
+                    self.acked_seqs.add(seq)
+                    if i is not None:
+                        self.path_retransmit[i].discard(seq)
+        # Advance each chain's window base past its contiguously-ACKed seqs.
+        for i in range(self.num_of_paths):
+            while self.path_send_base[i] in self.acked_seqs:
+                self.path_send_base[i] += self.num_of_paths
+        # NACKs name the missing seq directly; re-queue if still outstanding and
+        # overdue (once per end-to-end RTT).
+        for fb in self.feedbacks:
+            if fb.is_nack():
+                i = self.gid_to_index.get(fb.get_global_path())
+                if i is None:
+                    continue
+                for seq in (fb.get_related_information_packets() or []):
+                    if self._e2e_retransmit_due(seq):
+                        self.path_retransmit[i].add(seq)
+        # Tail backstop: the last packet(s) of a chain have no higher seq to reveal
+        # them as a gap, so the receiver never NACKs them. Re-queue any outstanding
+        # (sent, not yet ACKed, in-window) seq that is overdue, so the source cannot
+        # deadlock waiting for an ACK that will never arrive.
+        for i in range(self.num_of_paths):
+            seq = self.path_send_base[i]
+            while seq < self.path_next_new_seq[i]:
+                if self._e2e_retransmit_due(seq):
+                    self.path_retransmit[i].add(seq)
+                seq += self.num_of_paths
+
+    def _e2e_retransmit_due(self, seq: int) -> bool:
+        """True if an outstanding seq should be retransmitted now: not yet ACKed
+        end-to-end and last (re)transmitted at least one end-to-end RTT ago."""
+        if seq in self.acked_seqs:
+            return False
+        last = self.last_send_slot.get(seq)
+        if last is None:
+            return False
+        return (self.t - last) >= self.e2e_rtt
 
     def _transmit(self):
         for i, path in enumerate(self.paths):
