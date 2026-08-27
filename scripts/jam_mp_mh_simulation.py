@@ -75,7 +75,7 @@ from mh_epsilon_matrix import (
     print_article_epsilon_matrix,
     validate_article_matrix,
 )
-from Network import MpMhNetwork, SimulationStats
+from Network import MpMhNetwork, SimulationStats, FeedbackSource
 from JamNetwork import JamMpMhNetwork
 
 
@@ -155,6 +155,7 @@ def run_jam_network(
     jammer_k: int,
     initial_epsilon: float = 0.5,
     debug: bool = False,
+    feedback_source: FeedbackSource = FeedbackSource.HBH,
 ) -> SimulationStats:
     """Run one JamMpMhNetwork simulation. Returns zeroed SimulationStats if
     no packets decoded (avoids the pre-existing ZeroDivisionError)."""
@@ -171,6 +172,7 @@ def run_jam_network(
         jammer_alpha=jammer_alpha,
         jammer_k=jammer_k,
         debug=debug,
+        feedback_source=feedback_source,
     )
 
     if max_iterations is None:
@@ -210,6 +212,7 @@ def run_mp_mh_network(
     max_iterations: int | None,
     initial_epsilon: float = 0.5,
     debug: bool = False,
+    feedback_source: FeedbackSource = FeedbackSource.HBH,
 ) -> SimulationStats:
     """Run one MpMhNetwork simulation at (e1, e2) for direct comparison."""
     network = MpMhNetwork(
@@ -223,6 +226,7 @@ def run_mp_mh_network(
         threshold=threshold,
         num_hops=num_hops,
         debug=debug,
+        feedback_source=feedback_source,
     )
     network.run_sim()
     return network.get_simulation_stats()
@@ -491,7 +495,8 @@ def _run_one_sim_task(args: tuple) -> tuple:
 
     args: (group_key, k, e1, e2, it, alpha,
            num_paths, num_hops, rtt, threshold, o_bar,
-           num_packets_to_send, max_iterations, initial_epsilon)
+           num_packets_to_send, max_iterations, initial_epsilon,
+           feedback_source)
     """
     (
         group_key,
@@ -508,6 +513,7 @@ def _run_one_sim_task(args: tuple) -> tuple:
         num_packets_to_send,
         max_iterations,
         initial_epsilon,
+        feedback_source,
     ) = args
     eps_matrix = chain_major_epsilons(e1, e2, num_hops)
     stats = run_jam_network(
@@ -523,6 +529,7 @@ def _run_one_sim_task(args: tuple) -> tuple:
         jammer_k=k,
         initial_epsilon=initial_epsilon,
         debug=False,
+        feedback_source=feedback_source,
     )
     return (group_key, k, float(e1), float(e2), it, alpha, stats)
 
@@ -579,6 +586,7 @@ def mode_sweep_k(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    feedback_source: FeedbackSource,
     parallel_workers: int = 1,
 ) -> None:
     if load_existing and os.path.exists(results_file):
@@ -602,6 +610,7 @@ def mode_sweep_k(
                     num_packets_to_send,
                     max_iterations,
                     initial_epsilon,
+                    feedback_source,
                 ))
 
         results: list[tuple[int, SimulationStats]] = []
@@ -629,7 +638,8 @@ def mode_sweep_k(
         x_label="Jammer k (paths blocked per round)",
         title_suffix=(
             f"JamMpMhNetwork sweep_k (H={num_hops}, P={num_paths}, "
-            f"alpha={jammer_alpha}, RTT={rtt}, eps_template e1={e1} e2={e2})"
+            f"alpha={jammer_alpha}, RTT={rtt}, eps_template e1={e1} e2={e2}, "
+            f"feedback={feedback_source.name})"
         ),
         plot_path=plot_file,
     )
@@ -653,6 +663,7 @@ def mode_sweep_alpha(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    feedback_source: FeedbackSource,
 ) -> None:
     if load_existing and os.path.exists(results_file):
         results = load_pickle(results_file)
@@ -677,6 +688,7 @@ def mode_sweep_alpha(
                     jammer_k=jammer_k,
                     initial_epsilon=initial_epsilon,
                     debug=False,
+                    feedback_source=feedback_source,
                 )
                 results.append((alpha, stats))
                 print(
@@ -692,7 +704,8 @@ def mode_sweep_alpha(
         x_label="Jammer alpha (jamming round = RTT/alpha)",
         title_suffix=(
             f"JamMpMhNetwork sweep_alpha (H={num_hops}, P={num_paths}, "
-            f"k={jammer_k}, RTT={rtt}, eps_template e1={e1} e2={e2})"
+            f"k={jammer_k}, RTT={rtt}, eps_template e1={e1} e2={e2}, "
+            f"feedback={feedback_source.name})"
         ),
         plot_path=plot_file,
     )
@@ -713,6 +726,7 @@ def mode_validate_k0(
     initial_epsilon: float,
     results_file: str,
     load_existing: bool,
+    feedback_source: FeedbackSource,
 ) -> None:
     """Run JamMpMhNetwork with jammer_k=0 and MpMhNetwork at the same ε.
     Both use the paper template, with the same loss matrix per chain/path.
@@ -740,6 +754,7 @@ def mode_validate_k0(
                 jammer_k=0,
                 initial_epsilon=initial_epsilon,
                 debug=False,
+                feedback_source=feedback_source,
             )
             results["jam_k0"].append(jam_stats)
             print(
@@ -760,6 +775,7 @@ def mode_validate_k0(
                 max_iterations=max_iterations,
                 initial_epsilon=initial_epsilon,
                 debug=False,
+                feedback_source=feedback_source,
             )
             results["mpmh"].append(mp_stats)
             print(
@@ -812,6 +828,7 @@ def mode_sweep_k_multi_eps(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    feedback_source: FeedbackSource,
     parallel_workers: int = 1,
 ) -> None:
     """Sweep jammer_k for each (e1, e2) in eps_pairs and overlay all curves
@@ -839,6 +856,7 @@ def mode_sweep_k_multi_eps(
                         num_packets_to_send,
                         max_iterations,
                         initial_epsilon,
+                        feedback_source,
                     ))
 
         per_eps_results: dict[tuple[float, float], list[tuple[int, SimulationStats]]] = {
@@ -878,7 +896,8 @@ def mode_sweep_k_multi_eps(
         x_label="Jammer k (paths blocked per round)",
         title_suffix=(
             f"JamMpMhNetwork sweep_k_multi_eps "
-            f"(H={num_hops}, P={num_paths}, alpha={jammer_alpha}, RTT={rtt})"
+            f"(H={num_hops}, P={num_paths}, alpha={jammer_alpha}, RTT={rtt}, "
+            f"feedback={feedback_source.name})"
         ),
         plot_path=plot_file,
     )
@@ -901,6 +920,7 @@ def mode_sweep_eps_grid_per_k(
     results_file: str,
     plot_file: str,
     load_existing: bool,
+    feedback_source: FeedbackSource,
     parallel_workers: int = 1,
 ) -> None:
     """Sweep (e1, e2) over the eps_values × eps_values grid (mp_mh_simulation.py
@@ -935,11 +955,12 @@ def mode_sweep_eps_grid_per_k(
                             num_paths,
                             num_hops,
                             rtt,
-                            threshold,
-                            o_bar,
-                            num_packets_to_send,
-                            max_iterations,
-                            initial_epsilon,
+                        threshold,
+                        o_bar,
+                        num_packets_to_send,
+                        max_iterations,
+                        initial_epsilon,
+                        feedback_source,
                         ))
 
         per_k_results: dict[int, list[tuple[float, float, SimulationStats]]] = {
@@ -1007,7 +1028,8 @@ def mode_sweep_eps_grid_per_k(
         eps_values_e2=eps_sorted,
         title_suffix=(
             f"JamMpMhNetwork sweep_eps_grid_per_k (H={num_hops}, P={num_paths}, "
-            f"alpha={jammer_alpha}, RTT={rtt}); compare k=0 surface to mp_mh_simulation.py output"
+            f"alpha={jammer_alpha}, RTT={rtt}, feedback={feedback_source.name}); "
+            f"compare k=0 surface to mp_mh_simulation.py output"
         ),
         plot_path=plot_file,
         capacity_func=capacity_func,
@@ -1042,6 +1064,13 @@ def _run_main() -> None:
     MODE = "sweep_eps_grid_per_k"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_alpha", "validate_k0"
     LOAD_EXISTING = False
 
+    # ---- Feedback source selection ---------------------------------------
+    # FeedbackSource.HBH (hop-by-hop) or FeedbackSource.E2E (end-to-end).
+    # Mirrors scripts/mp_mh_simulation.py. The name is appended to every
+    # results/plot filename so E2E and HBH outputs never collide.
+    FEEDBACK_SOURCE = FeedbackSource.HBH
+    _FB_TAG = FEEDBACK_SOURCE.name  # "E2E" or "HBH"
+
     # Parallelization for the heavy sweep modes (sweep_k, sweep_k_multi_eps,
     # sweep_eps_grid_per_k). 1 = serial. A safe default is os.cpu_count() // 2
     # to leave headroom for the OS / other apps. Set to os.cpu_count() to use
@@ -1051,8 +1080,8 @@ def _run_main() -> None:
     # sweep_k config
     K_VALUES: list[int] = list(range(0, NUM_PATHS * NUM_HOPS + 1))
     SWEEP_K_ALPHA = 2
-    K_RESULTS_FILE = "jam_sweep_k_results.pkl"
-    K_PLOT_FILE = "jam_sweep_k.png"
+    K_RESULTS_FILE = f"jam_sweep_k_results_{_FB_TAG}.pkl"
+    K_PLOT_FILE = f"jam_sweep_k_{_FB_TAG}.png"
 
     # sweep_k_multi_eps config: each (e1, e2) becomes one labeled line in the plots
     MULTI_EPS_PAIRS: list[tuple[float, float]] = [
@@ -1061,8 +1090,8 @@ def _run_main() -> None:
         (0.3, 0.3),    # mid loss
         (0.5, 0.5),    # high loss
     ]
-    MULTI_EPS_RESULTS_FILE = "jam_sweep_k_multi_eps_results.pkl"
-    MULTI_EPS_PLOT_FILE = "jam_sweep_k_multi_eps.png"
+    MULTI_EPS_RESULTS_FILE = f"jam_sweep_k_multi_eps_results_{_FB_TAG}.pkl"
+    MULTI_EPS_PLOT_FILE = f"jam_sweep_k_multi_eps_{_FB_TAG}.png"
 
     # sweep_eps_grid_per_k config: same (e1, e2) sweep convention as
     # mp_mh_simulation.py (8x8 grid via np.arange(0.1, 0.9, 0.1)),
@@ -1071,17 +1100,17 @@ def _run_main() -> None:
     # EPS_GRID_K_VALUES: list[int] = [0, 2, 4, 6, 8, 10, 12]
     tot_paths = NUM_HOPS * NUM_PATHS
     EPS_GRID_K_VALUES: list[int] = [0, int(0.25 * tot_paths), int(0.5 * tot_paths), int(0.75 * tot_paths)]
-    EPS_GRID_RESULTS_FILE = "jam_sweep_eps_grid_per_k_results.pkl"
-    EPS_GRID_PLOT_FILE = "jam_sweep_eps_grid_per_k.png"
+    EPS_GRID_RESULTS_FILE = f"jam_sweep_eps_grid_per_k_results_{_FB_TAG}.pkl"
+    EPS_GRID_PLOT_FILE = f"jam_sweep_eps_grid_per_k_{_FB_TAG}.png"
 
     # sweep_alpha config
     ALPHA_VALUES: list[int] = [1, 2, 3, 4, 6, 12]
     SWEEP_ALPHA_K = 2
-    ALPHA_RESULTS_FILE = "jam_sweep_alpha_results.pkl"
-    ALPHA_PLOT_FILE = "jam_sweep_alpha.png"
+    ALPHA_RESULTS_FILE = f"jam_sweep_alpha_results_{_FB_TAG}.pkl"
+    ALPHA_PLOT_FILE = f"jam_sweep_alpha_{_FB_TAG}.png"
 
     # validate_k0 config
-    VALIDATE_RESULTS_FILE = "jam_validate_k0_results.pkl"
+    VALIDATE_RESULTS_FILE = f"jam_validate_k0_results_{_FB_TAG}.pkl"
 
     print("\nSimulation parameters:")
     print(f"  - RTT (slots): {RTT}, prop_delay: {PROP_DELAY}")
@@ -1091,6 +1120,7 @@ def _run_main() -> None:
     print(f"  - Outer iterations: {NUM_ITERATIONS}")
     print(f"  - eps template: e1={EPS_E1}, e2={EPS_E2}")
     print_article_epsilon_matrix(EPS_E1, EPS_E2, NUM_PATHS, NUM_HOPS)
+    print(f"  - Feedback source: {FEEDBACK_SOURCE.name}")
     print(f"  - MODE: {MODE}\n")
 
     if MODE == "sweep_k":
@@ -1111,6 +1141,7 @@ def _run_main() -> None:
             results_file=K_RESULTS_FILE,
             plot_file=K_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            feedback_source=FEEDBACK_SOURCE,
             parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_k_multi_eps":
@@ -1130,6 +1161,7 @@ def _run_main() -> None:
             results_file=MULTI_EPS_RESULTS_FILE,
             plot_file=MULTI_EPS_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            feedback_source=FEEDBACK_SOURCE,
             parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_eps_grid_per_k":
@@ -1149,6 +1181,7 @@ def _run_main() -> None:
             results_file=EPS_GRID_RESULTS_FILE,
             plot_file=EPS_GRID_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            feedback_source=FEEDBACK_SOURCE,
             parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "sweep_alpha":
@@ -1169,6 +1202,7 @@ def _run_main() -> None:
             results_file=ALPHA_RESULTS_FILE,
             plot_file=ALPHA_PLOT_FILE,
             load_existing=LOAD_EXISTING,
+            feedback_source=FEEDBACK_SOURCE,
         )
     elif MODE == "validate_k0":
         mode_validate_k0(
@@ -1185,6 +1219,7 @@ def _run_main() -> None:
             initial_epsilon=INITIAL_EPSILON,
             results_file=VALIDATE_RESULTS_FILE,
             load_existing=LOAD_EXISTING,
+            feedback_source=FEEDBACK_SOURCE,
         )
     else:
         raise ValueError(f"Unknown MODE: {MODE!r}")

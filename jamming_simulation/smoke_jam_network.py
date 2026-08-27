@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "mp_mh_network"))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "jamming_simulation"))
 
 from JamNetwork import JamMpMhNetwork
+from feedback_source import FeedbackSource
 
 
 def _uniform_eps(num_paths: int, num_hops: int, eps: float) -> list[list[float]]:
@@ -169,8 +170,63 @@ def smoke_no_jam():
     print("  PASSED")
 
 
+def smoke_e2e():
+    print("\n=== Smoke 4: H=3, P=3, k=1, end-to-end (E2E) feedback ===")
+    H, P = 3, 3
+    NUM_PACKETS = 50
+    PROP_DELAY = 6
+    network = JamMpMhNetwork(
+        path_epsilons=_uniform_eps(P, H, eps=0.1),
+        num_paths=P,
+        num_hops=H,
+        global_prop_delay=PROP_DELAY,
+        num_packets_to_send=NUM_PACKETS,
+        max_iterations=4000,
+        jammer_alpha=2,
+        jammer_k=1,
+        debug=False,
+        feedback_source=FeedbackSource.E2E,
+    )
+
+    # One dedicated end-to-end feedback channel per global path (= per chain).
+    assert network.feedback_source == FeedbackSource.E2E
+    assert len(network.e2e_feedback_channels) == P, (
+        f"expected {P} E2E feedback channels, got {len(network.e2e_feedback_channels)}"
+    )
+    assert sorted(network.e2e_feedback_channels.keys()) == list(range(1, P + 1)), (
+        f"E2E channels should be keyed by global path index 1..{P}, "
+        f"got {sorted(network.e2e_feedback_channels.keys())}"
+    )
+
+    network.run_sim()
+
+    stats = network.get_simulation_stats()
+    assert stats is not None, "simulation_stats should be populated after run_sim"
+    assert stats.normalized_throughput > 0.0, (
+        f"throughput should be >0, got {stats.normalized_throughput}"
+    )
+    assert stats.num_information_packets_decoded == NUM_PACKETS, (
+        f"expected {NUM_PACKETS} decoded, got {stats.num_information_packets_decoded}"
+    )
+
+    # The receiver must have emitted end-to-end feedback back to the source.
+    total_e2e_feedback = sum(
+        len(ch.get_channel_history()) for ch in network.e2e_feedback_channels.values()
+    )
+    assert total_e2e_feedback > 0, "expected the receiver to send end-to-end feedback"
+
+    print(
+        f"  decoded={stats.num_information_packets_decoded}/{NUM_PACKETS} "
+        f"in t={network.t}, throughput={stats.normalized_throughput:.3f}, "
+        f"mean delay={stats.inorder_delay_mean:.2f}, max delay={stats.inorder_delay_max}"
+    )
+    print(f"  E2E feedback channels: {P} | total E2E feedback packets: {total_e2e_feedback}")
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     smoke_basic()
     smoke_full_jam()
     smoke_no_jam()
+    smoke_e2e()
     print("\nAll smoke tests passed.")

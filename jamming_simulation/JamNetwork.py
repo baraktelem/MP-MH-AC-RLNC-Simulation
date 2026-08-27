@@ -37,6 +37,13 @@ from mp_mh_network.Network import MhNetwork
 from mp_mh_network.Node import Node
 from mp_mh_network.Receiver import SimReceiver
 from mp_mh_network.Sender import SimSender
+# Import the leaf modules the SAME way the units (Receiver/Sender/Node) do -- as
+# top-level modules (mp_mh_network is on sys.path). Importing them package-qualified
+# (mp_mh_network.feedback_source / mp_mh_network.Channels) would create a SECOND copy
+# of the module, so FeedbackSource.E2E here would not be identical to the enum member
+# the units compare against, breaking the `feedback_source in (...)` assertions.
+from Channels import Channel
+from feedback_source import FeedbackSource
 
 from JamChannels import JamPath
 from Jammer import Jammer
@@ -65,6 +72,7 @@ class JamMpMhNetwork(MhNetwork):
         jammer_alpha: int = 2,
         jammer_k: int = 1,
         debug: bool = False,
+        feedback_source: FeedbackSource = FeedbackSource.HBH,
     ):
         super().__init__(
             path_epsilons,
@@ -90,6 +98,28 @@ class JamMpMhNetwork(MhNetwork):
                 f"got {len(chain_eps)}"
             )
 
+        # Feedback source (hop-by-hop vs end-to-end)
+        self.feedback_source = feedback_source
+        assert feedback_source in (FeedbackSource.HBH, FeedbackSource.E2E), \
+            f"Invalid feedback source: {feedback_source}"
+
+        # End-to-end feedback channels: one dedicated channel per global path
+        # (= per chain, since chain identity is fixed here), carrying ACK/NACKs
+        # straight from the SimReceiver back to the SimSender with the full
+        # end-to-end one-way delay (global_prop_delay).
+        self.e2e_feedback_channels: dict[int, Channel] = {}
+        if self.feedback_source == FeedbackSource.E2E:
+            for global_path_idx in range(1, num_paths + 1):
+                channel = Channel(
+                    self.global_prop_delay,
+                    hop_index=0,
+                    path_index_in_hop=global_path_idx - 1,
+                    name_prefix=f"E2E[{global_path_idx}].",
+                    debug=self.debug,
+                )
+                channel.set_global_path_index(global_path_idx)
+                self.e2e_feedback_channels[global_path_idx] = channel
+
         self.paths: list[list[JamPath]] = [[] for _ in range(num_paths)]
         self._build_paths()
 
@@ -98,6 +128,9 @@ class JamMpMhNetwork(MhNetwork):
             hop_rtt=self.hop_rtt,
             unit_name="SimReceiver",
             debug=self.debug,
+            feedback_source=self.feedback_source,
+            e2e_feedback_channels=self.e2e_feedback_channels,
+            e2e_prop_delay=self.global_prop_delay,
         )
 
         self.nodes: list[list[Node]] = [
@@ -117,6 +150,8 @@ class JamMpMhNetwork(MhNetwork):
             network=self,
             next_hop=None,
             debug=self.debug,
+            feedback_source=self.feedback_source,
+            e2e_feedback_channels=self.e2e_feedback_channels,
         )
 
         all_paths = [p for chain in self.paths for p in chain]
@@ -155,6 +190,7 @@ class JamMpMhNetwork(MhNetwork):
                     next_hop=None,
                     Network=self,
                     debug=self.debug,
+                    feedback_source=self.feedback_source,
                 )
                 self.nodes[c][h] = node
     
