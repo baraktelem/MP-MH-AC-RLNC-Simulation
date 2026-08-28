@@ -130,6 +130,8 @@ class SRSimReceiver(GeneralReceiver):
             self._send_e2e_feedbacks_slot()
         elif self.feedback_mode == SRFeedbackMode.E2E_FULL_ARQ:
             self._send_e2e_feedbacks_seq()
+        elif self.feedback_mode == SRFeedbackMode.E2E_TIMEOUT:
+            self._send_e2e_feedbacks_ack_only()
 
     def _after_rlnc_arrived(self, receiver_path: ReceiverPath, arrived_packet: RLNCPacket) -> None:
         gid = arrived_packet.get_global_path()
@@ -193,6 +195,18 @@ class SRSimReceiver(GeneralReceiver):
             for seq in range(exp, hi, self.stride):
                 if seq not in buf:
                     self._send_e2e_feedback(gid, FeedbackType.NACK, PacketID(gid, self.t), [seq])
+
+    def _send_e2e_feedbacks_ack_only(self) -> None:
+        """E2E_TIMEOUT: ACK-only end-to-end feedback (the external SR-ARQ baseline).
+
+        The source recovers losses with its own retransmission timer, so the
+        receiver never NACKs; it only ACKs every physical arrival this tick
+        (seq-based) so the source learns which seqs reached the destination and
+        stops resending them. Forward-only relays make the forward delay
+        deterministic, so a seq that is never ACKed is exactly a lost one -- which
+        the source's timer resends a full end-to-end RTT after its last send."""
+        for gid, seq in self._e2e_arrivals:
+            self._send_e2e_feedback(gid, FeedbackType.ACK, PacketID(gid, self.t), [seq])
 
     def _send_e2e_feedback(self, global_path_id, feedback_type, related_packet_id,
                            related_information_packets) -> None:

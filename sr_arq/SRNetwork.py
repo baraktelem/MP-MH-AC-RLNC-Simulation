@@ -171,6 +171,7 @@ class SRMpMhNetwork(MhNetwork):
             SRFeedbackMode.HBH,
             SRFeedbackMode.E2E_FORWARD_ONLY,
             SRFeedbackMode.E2E_FULL_ARQ,
+            SRFeedbackMode.E2E_TIMEOUT,
         ), f"Invalid feedback mode: {feedback_mode}"
         self.feedback_mode = feedback_mode
         # Set only when max_iterations is the binding stop condition. Throughput

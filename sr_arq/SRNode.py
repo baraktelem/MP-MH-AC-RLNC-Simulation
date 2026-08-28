@@ -82,10 +82,11 @@ class SRNodeReceiver(GeneralReceiver):
         self._peer_acked: set[int] | None = None
 
     def run_step(self, time: int = None):
-        # E2E_FORWARD_ONLY: best-effort relay input -- capture this tick's single
-        # arrival with NO upstream feedback and NO received_seqs bookkeeping (the
-        # node forwards the raw arrival immediately; see SRNode.run_step).
-        if self.feedback_mode == SRFeedbackMode.E2E_FORWARD_ONLY:
+        # Forward-only relays (E2E_FORWARD_ONLY / E2E_TIMEOUT): best-effort relay
+        # input -- capture this tick's single arrival with NO upstream feedback and
+        # NO received_seqs bookkeeping (the node forwards the raw arrival
+        # immediately; see SRNode.run_step).
+        if self.feedback_mode.uses_forward_only_relays():
             if time is not None:
                 self.t = time
             else:
@@ -292,11 +293,12 @@ class SRNode:
         self.my_receiver._peer_acked = self.my_sender.acked_seqs
 
     def run_step(self, time: int = None):
-        # E2E_FORWARD_ONLY: best-effort store-and-forward. Take this tick's arrival
-        # (no upstream feedback) and forward it once on the output path, re-stamping
-        # the chain's global id and a fresh creation_time. Duplicates ARE re-forwarded
-        # so that source retransmissions propagate. No per-hop retransmit queue/window.
-        if self.feedback_mode == SRFeedbackMode.E2E_FORWARD_ONLY:
+        # Forward-only relays (E2E_FORWARD_ONLY / E2E_TIMEOUT): best-effort
+        # store-and-forward. Take this tick's arrival (no upstream feedback) and
+        # forward it once on the output path, re-stamping the chain's global id and
+        # a fresh creation_time. Duplicates ARE re-forwarded so that source
+        # retransmissions propagate. No per-hop retransmit queue/window.
+        if self.feedback_mode.uses_forward_only_relays():
             self.my_receiver.run_step(time)
             self.my_sender.t = self.my_receiver.t
             out_path = self.my_sender.paths[0]

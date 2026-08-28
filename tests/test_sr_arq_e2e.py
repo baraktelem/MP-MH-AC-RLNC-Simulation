@@ -1,4 +1,4 @@
-"""Tests for the two end-to-end (E2E) feedback variants of multi-hop SR-ARQ.
+"""Tests for the three end-to-end (E2E) feedback variants of multi-hop SR-ARQ.
 
 Covers:
 - E2E_FORWARD_ONLY (Type A, paper Fig. 19 top): forward-only relays, slot-based
@@ -7,7 +7,11 @@ Covers:
 - E2E_FULL_ARQ (Type B, mp_mh-style): full per-hop SR-ARQ relays, seq-based
   selective-repeat end-to-end feedback -> light-loss full decode, no spurious
   retransmission when lossless, and retransmission paced to once per e2e RTT.
-- H=1: both E2E variants reduce to HBH (identical delivery / first-transmission).
+- E2E_TIMEOUT (Type C, external SR-ARQ baseline): forward-only relays, ACK-only
+  end-to-end feedback + a source retransmission timer -> lossless full decode with
+  no retransmission, light-loss full decode with timer-paced retransmission, and
+  the receiver never NACKs.
+- H=1: all E2E variants reduce to HBH (identical delivery / first-transmission).
 """
 
 import os
@@ -169,15 +173,80 @@ def test_type_b_retransmission_paced_by_e2e_rtt():
 
 
 # ---------------------------------------------------------------------------
-# H=1: both E2E variants reduce to HBH
+# Type C - E2E_TIMEOUT (external SR-ARQ baseline)
+# ---------------------------------------------------------------------------
+
+def test_type_c_full_decode_lossless():
+    """Forward-only relays + ACK-only end-to-end feedback + a source retransmission
+    timer: with no erasures every packet is delivered end-to-end and the timer never
+    fires (the ACK always beats the timeout), so each seq is transmitted once."""
+    P, K = 4, 12
+    net = _net([[0.0, 0.0, 0.0]] * P, num_paths=P, num_hops=3, gpd=6,
+               mode=SRFeedbackMode.E2E_TIMEOUT, packets_per_path=K,
+               window=None, max_iterations=20000)
+    net.run_sim()
+    assert len(net.receiver.information_packets_decoding_times) == P * K
+    assert len(net.sender.sent_new_rlnc_history) == P * K, (
+        "lossless E2E_TIMEOUT must not retransmit any packet"
+    )
+
+
+def test_type_c_full_decode_light_loss():
+    """Forward-only relays + timer-driven end-to-end retransmission on the paper's
+    lossy 4x3 grid: a packet is delivered only if it survives all H hops, and the
+    timer recovers every loss, so all P*K packets arrive in order. The recovery is
+    timer-paced: consecutive (re)transmissions of a seq are >= one e2e RTT apart."""
+    random.seed(19)
+    P, K = 4, 15
+    matrix = [[0.1, 0.2, 0.1], [0.2, 0.1, 0.2], [0.1, 0.3, 0.1], [0.2, 0.1, 0.3]]
+    net = _net(matrix, num_paths=P, num_hops=3, gpd=6,
+               mode=SRFeedbackMode.E2E_TIMEOUT, packets_per_path=K,
+               window=22, max_iterations=50000)
+    net.run_sim()
+    assert len(net.receiver.information_packets_decoding_times) == P * K
+
+    # Genuine loss recovery means more transmissions than packets ...
+    assert len(net.sender.sent_new_rlnc_history) > P * K
+    # ... and it is timer-driven, so resends of the same seq are >= global_rtt apart.
+    send_times: dict[int, list[int]] = {}
+    for pkt in net.sender.sent_new_rlnc_history:
+        send_times.setdefault(pkt.get_seq(), []).append(pkt.get_creation_time())
+    for seq, times in send_times.items():
+        times.sort()
+        for a, b in zip(times, times[1:]):
+            assert b - a >= net.global_rtt, (
+                f"seq {seq} re-sent after {b - a} < global_rtt {net.global_rtt}"
+            )
+
+
+def test_type_c_receiver_sends_only_acks():
+    """E2E_TIMEOUT recovery is entirely the source's timer, so the end-to-end
+    feedback the source receives must be ACK-only (no NACKs), even under loss."""
+    random.seed(23)
+    P, K = 4, 8
+    matrix = [[0.2, 0.2, 0.1], [0.3, 0.1, 0.2], [0.1, 0.3, 0.2], [0.2, 0.2, 0.3]]
+    net = _net(matrix, num_paths=P, num_hops=3, gpd=6,
+               mode=SRFeedbackMode.E2E_TIMEOUT, packets_per_path=K,
+               window=22, max_iterations=50000)
+    net.run_sim()
+    assert len(net.receiver.information_packets_decoding_times) == P * K
+    fb_hist = net.sender.all_feedback_history
+    assert any(fb.is_ack() for fb in fb_hist), "source should receive end-to-end ACKs"
+    nacks = [fb for fb in fb_hist if fb.is_nack()]
+    assert not nacks, f"E2E_TIMEOUT source must never receive a NACK, got {len(nacks)}"
+
+
+# ---------------------------------------------------------------------------
+# H=1: all E2E variants reduce to HBH
 # ---------------------------------------------------------------------------
 
 def test_h1_e2e_equals_hbh_lossless():
-    """With a single hop there are no relays, so all three modes are the same
+    """With a single hop there are no relays, so all four modes are the same
     single-hop SR-ARQ and produce identical delivery / first-transmission maps."""
     P, K = 3, 12
     results = {}
-    for mode in (SRFeedbackMode.HBH, SRFeedbackMode.E2E_FORWARD_ONLY, SRFeedbackMode.E2E_FULL_ARQ):
+    for mode in (SRFeedbackMode.HBH, SRFeedbackMode.E2E_FORWARD_ONLY,
+                 SRFeedbackMode.E2E_FULL_ARQ, SRFeedbackMode.E2E_TIMEOUT):
         net = _net([[0.0]] * P, num_paths=P, num_hops=1, gpd=3,
                    mode=mode, packets_per_path=K, window=None, max_iterations=20000)
         net.run_sim()
@@ -186,7 +255,8 @@ def test_h1_e2e_equals_hbh_lossless():
             dict(net.receiver.information_packets_decoding_times),
         )
     base_first, base_dec = results[SRFeedbackMode.HBH]
-    for mode in (SRFeedbackMode.E2E_FORWARD_ONLY, SRFeedbackMode.E2E_FULL_ARQ):
+    for mode in (SRFeedbackMode.E2E_FORWARD_ONLY, SRFeedbackMode.E2E_FULL_ARQ,
+                 SRFeedbackMode.E2E_TIMEOUT):
         first, dec = results[mode]
         assert first == base_first, f"{mode.name}: first-transmission map differs from HBH"
         assert dec == base_dec, f"{mode.name}: delivery map differs from HBH"
@@ -200,5 +270,8 @@ if __name__ == "__main__":
     test_type_b_full_decode_light_loss()
     test_type_b_no_retransmission_when_lossless()
     test_type_b_retransmission_paced_by_e2e_rtt()
+    test_type_c_full_decode_lossless()
+    test_type_c_full_decode_light_loss()
+    test_type_c_receiver_sends_only_acks()
     test_h1_e2e_equals_hbh_lossless()
     print("All SR-ARQ E2E tests passed.")

@@ -77,9 +77,9 @@ class SRSender(GeneralSender):
         if feedback_mode.is_e2e():
             assert e2e_feedback_channels is not None, \
                 "E2E feedback channels are required for an end-to-end feedback mode"
-        if feedback_mode == SRFeedbackMode.E2E_FULL_ARQ:
+        if feedback_mode in (SRFeedbackMode.E2E_FULL_ARQ, SRFeedbackMode.E2E_TIMEOUT):
             assert e2e_rtt is not None, \
-                "e2e_rtt is required for E2E_FULL_ARQ (retransmission pacing / tail backstop)"
+                "e2e_rtt is required for E2E_FULL_ARQ / E2E_TIMEOUT (retransmission timer)"
         # slot at which each seq was last (re)transmitted on the forward channel;
         # used by E2E_FULL_ARQ to rate-limit retransmission to once per e2e RTT.
         self.last_send_slot: dict[int, int] = {}
@@ -267,9 +267,14 @@ class SRSimSender(SRSender):
         self.admission_closed = True
 
     def _process_feedbacks(self):
-        # E2E_FULL_ARQ uses seq-based selective-repeat feedback (the receiver names
-        # the missing seq); HBH and E2E_FORWARD_ONLY use slot-based feedback (the
-        # NACK's creation_time resolves to a seq via the path's slot->seq record).
+        # E2E_TIMEOUT uses ACK-only feedback + a pure retransmission timer (no
+        # NACKs). E2E_FULL_ARQ uses seq-based selective-repeat feedback (the
+        # receiver names the missing seq); HBH and E2E_FORWARD_ONLY use slot-based
+        # feedback (the NACK's creation_time resolves to a seq via the path's
+        # slot->seq record).
+        if self.feedback_mode == SRFeedbackMode.E2E_TIMEOUT:
+            self._process_feedbacks_timeout()
+            return
         if self.feedback_mode == SRFeedbackMode.E2E_FULL_ARQ:
             self._process_feedbacks_seq()
             return
@@ -333,6 +338,38 @@ class SRSimSender(SRSender):
         # them as a gap, so the receiver never NACKs them. Re-queue any outstanding
         # (sent, not yet ACKed, in-window) seq that is overdue, so the source cannot
         # deadlock waiting for an ACK that will never arrive.
+        for i in range(self.num_of_paths):
+            seq = self.path_send_base[i]
+            while seq < self.path_next_new_seq[i]:
+                if self._e2e_retransmit_due(seq):
+                    self.path_retransmit[i].add(seq)
+                seq += self.num_of_paths
+
+    def _process_feedbacks_timeout(self):
+        """E2E_TIMEOUT: ACK-only feedback + pure timeout retransmission (the
+        external SR-ARQ baseline).
+
+        The receiver only ACKs arrivals (never NACKs), so loss detection is entirely
+        the source's timer: with forward-only relays the forward delay is
+        deterministic, so any outstanding (sent, not yet ACKed) seq that has gone at
+        least one end-to-end RTT since its last (re)transmission is treated as lost
+        and re-queued. The timer sweep runs every tick regardless of whether any
+        feedback arrived this tick.
+        """
+        # ACKs first: mark delivered and clear any pending retransmit on the owning path.
+        for fb in self.feedbacks:
+            if fb.is_ack():
+                i = self.gid_to_index.get(fb.get_global_path())
+                for seq in (fb.get_related_information_packets() or []):
+                    self.acked_seqs.add(seq)
+                    if i is not None:
+                        self.path_retransmit[i].discard(seq)
+        # Advance each chain's window base past its contiguously-ACKed seqs.
+        for i in range(self.num_of_paths):
+            while self.path_send_base[i] in self.acked_seqs:
+                self.path_send_base[i] += self.num_of_paths
+        # Timeout: re-queue every outstanding seq whose last (re)transmission is at
+        # least one end-to-end RTT old and which is still not ACKed.
         for i in range(self.num_of_paths):
             seq = self.path_send_base[i]
             while seq < self.path_next_new_seq[i]:

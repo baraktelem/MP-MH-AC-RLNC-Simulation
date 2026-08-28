@@ -361,7 +361,7 @@ def load_pickle(filename: str):
 # Main
 # ---------------------------------------------------------------------------
 
-def _run_main() -> None:
+def sc_run_main() -> None:
     print("=" * 70)
     print(" " * 10 + "SR ARQ vs MP AC-RLNC -- MP sanity check (H=1)")
     print("=" * 70)

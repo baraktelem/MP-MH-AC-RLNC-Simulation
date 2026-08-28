@@ -226,37 +226,46 @@ def _run_main() -> None:
     #   SRFeedbackMode.HBH              -> hop-by-hop (paper Fig. 19 bottom; the default)
     #   SRFeedbackMode.E2E_FORWARD_ONLY -> forward-only relays, slot-based E2E (paper Fig. 19 top)
     #   SRFeedbackMode.E2E_FULL_ARQ     -> full per-hop SR-ARQ relays, seq-based E2E (mp_mh-style)
-    SR_FEEDBACK_MODE = SRFeedbackMode.E2E_FORWARD_ONLY
+    #   SRFeedbackMode.E2E_TIMEOUT      -> forward-only relays, ACK-only E2E + source
+    #                                      timeout retransmit (the external SR-ARQ baseline)
+    SR_FEEDBACK_MODE = SRFeedbackMode.E2E_TIMEOUT
     _FB_TAG = SR_FEEDBACK_MODE.name  # keeps HBH / E2E outputs from colliding
 
     # Window sizing. HBH runs an independent SR-ARQ per hop, so the per-hop RTT
-    # drives the window. Both E2E modes run the SR-ARQ end-to-end at the source, so
-    # the per-chain window must span a full end-to-end RTT; a per-hop window would
-    # stall each chain for a full RTT per end-to-end ACK and crush throughput.
-    # if SR_FEEDBACK_MODE.is_e2e():
-    #     SR_WINDOW = 2 * (RTT - 1)
-    # else:
-    #     SR_WINDOW = 2 * (HOP_RTT - 1)
-    SR_WINDOW = 2 * (HOP_RTT - 1)
+    # drives the window. All E2E modes (E2E_FORWARD_ONLY / E2E_FULL_ARQ /
+    # E2E_TIMEOUT) run the SR-ARQ end-to-end at the source, so the per-chain window
+    # must span a full end-to-end RTT; a per-hop window would stall each chain for a
+    # full RTT per end-to-end ACK and crush throughput. (Override SR_WINDOW below to
+    # match the external sim's window if desired.)
+    if SR_FEEDBACK_MODE.is_e2e():
+        SR_WINDOW = 2 * (RTT - 1)
+    else:
+        SR_WINDOW = 2 * (HOP_RTT - 1)
 
     NUM_ITERATIONS = 150
     # Equal new-packet quota per chain (None = unlimited). When set, each chain
     # admits exactly this many new seqs; global delivery target becomes P * N
     # (or 1 * N for the best single-path setting).
     PACKETS_PER_PATH = None
+    # End-of-simulation trigger -- pick one (E2E_TIMEOUT, like every mode, works
+    # with all three):
+    #   * MAX_ITERATIONS      -> fixed run time in slots (the external sim's
+    #                            `while time < T`, i.e. T == MAX_ITERATIONS)
+    #   * NUM_PACKETS_TO_SEND -> stop after this many global in-order deliveries
+    #   * PACKETS_PER_PATH    -> per-chain quota (global target = PACKETS_PER_PATH * P)
     # Optional hard time stop (None = run until all quota packets are delivered).
-    MAX_ITERATIONS = 2000
+    MAX_ITERATIONS = None
     # Legacy global packet target; ignored when PACKETS_PER_PATH is set.
-    NUM_PACKETS_TO_SEND = None
+    NUM_PACKETS_TO_SEND = 1000
     # Node forwarding discipline: False = out-of-order relay (efficient, low delay);
     # True = full SR-ARQ at each node (in-order forwarding, per-hop HOL blocking,
     # higher delay - matches the paper's "full SR-ARQ protocol at each node").
-    IN_ORDER_FORWARDING = True
+    IN_ORDER_FORWARDING = False
     # Per-relay flow-control buffer: max received-but-not-forwarded seqs a node
     # may hold before it applies backpressure (refuses new arrivals so the
     # upstream retransmits later). None = unbounded (no backpressure); a finite
     # value bounds the bottleneck queue and makes the in-order delay stationary.
-    NODE_QUEUE_SIZE = 256
+    NODE_QUEUE_SIZE = None
 
     PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
@@ -273,7 +282,13 @@ def _run_main() -> None:
         RESULTS_FILE = f"sr_arq_mpmh_results_{_FB_TAG}_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.pkl"
         PLOT_FILE = f"sr_arq_mpmh_compare_{_FB_TAG}_num_packets_to_send_{NUM_PACKETS_TO_SEND}_window_{SR_WINDOW}_RTT_{RTT}_in_order_forwarding_{IN_ORDER_FORWARDING}_node_queue_size_{NODE_QUEUE_SIZE}.png"
 
-    SETTINGS = ["best", "matched"] if not SR_FEEDBACK_MODE.is_e2e() else ["matched"]
+    # E2E_TIMEOUT (the external SR-ARQ baseline) also runs the single "best" path --
+    # its direct single-path analog -- alongside the P matched paths. The other two
+    # E2E modes (forward-only / full-ARQ) stay matched-only.
+    if SR_FEEDBACK_MODE in (SRFeedbackMode.E2E_FORWARD_ONLY, SRFeedbackMode.E2E_FULL_ARQ, SRFeedbackMode.E2E_TIMEOUT):
+        SETTINGS = ["matched"]
+    else:
+        SETTINGS = ["best", "matched"]
 
     print("\nParameters:")
     print(f"  feedback_mode={SR_FEEDBACK_MODE.name}")
