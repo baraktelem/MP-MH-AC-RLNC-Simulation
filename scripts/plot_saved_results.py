@@ -27,11 +27,24 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 from mp_simulation import plot_stats, aggregate_results
 from jam_mp_mh_simulation import plot_per_k_surfaces, network_min_cut_capacity
+from sr_arq_simulation import aggregate as sr_aggregate, plot_compare as sr_plot_compare
 
 
 # ---------------------------------------------------------------------------
-# Format detection + loading (supports flat list and jam per-k dict)
+# Format detection + loading (flat list, jam per-k dict, multi-series dict)
 # ---------------------------------------------------------------------------
+
+# Friendly labels for series keys used by sr_arq_* simulation pickles.
+_SERIES_LABELS = {
+    "best": "SR-ARQ best single path",
+    "matched": "SR-ARQ P matched paths",
+    "sr": "SR ARQ (shared multipath)",
+    "sr_indep": "SR ARQ (coupled round-robin)",
+    "sr_perpath": "SR ARQ (independent per-path)",
+    "sr_mpmh": "SR ARQ (MP-MH hop-by-hop)",
+    "ac": "MP AC-RLNC",
+}
+
 
 def is_per_k_results(obj) -> bool:
     """True when obj is {k: [(e1, e2, stats), ...]} from jam sweep_eps_grid_per_k.
@@ -56,9 +69,38 @@ def is_per_k_results(obj) -> bool:
     return saw_any_data
 
 
+def is_multi_series_results(obj) -> bool:
+    """True when obj is {series_name: [(e1, e2, stats), ...]} as saved by
+    sr_arq_simulation / sr_arq_mpmh_simulation (string keys, not int k)."""
+    if not isinstance(obj, dict) or not obj:
+        return False
+    if is_per_k_results(obj):
+        return False
+    saw_any_data = False
+    for key, value in obj.items():
+        if not isinstance(key, str) or not isinstance(value, list):
+            return False
+        if not value:
+            continue
+        saw_any_data = True
+        first = value[0]
+        if not isinstance(first, tuple) or len(first) != 3:
+            return False
+    return saw_any_data
+
+
+def series_label(key: str, file_stem: str | None = None) -> str:
+    """Map a pickle series key to a plot legend label."""
+    if key in _SERIES_LABELS:
+        return _SERIES_LABELS[key]
+    if file_stem:
+        return f"{file_stem}: {key}"
+    return key
+
+
 def load_results_any(filename: str):
-    """Load a pickle; supports flat list (mp_mh_simulation.py) and jam per-k
-    dict (jam_mp_mh_simulation.py sweep_eps_grid_per_k) formats."""
+    """Load a pickle; supports flat list, jam per-k dict, and multi-series
+    dict (sr_arq_* results_by_proto / results_by_setting) formats."""
     if not os.path.exists(filename):
         raise FileNotFoundError(f"Results file not found: {filename}")
     with open(filename, "rb") as f:
@@ -76,8 +118,18 @@ def load_results_any(filename: str):
         )
         if empty_ks:
             print(f"     Empty k value(s) (skipped in plot): {empty_ks}")
-    else:
+    elif is_multi_series_results(results):
+        non_empty = {k: v for k, v in results.items() if v}
+        total = sum(len(v) for v in non_empty.values())
+        keys = ", ".join(non_empty.keys())
+        print(
+            f"     Multi-series format: {len(non_empty)} series ({keys}), "
+            f"{total} total data points"
+        )
+    elif isinstance(results, list):
         print(f"     Total data points: {len(results)}")
+    else:
+        print(f"     Unrecognized format: {type(results).__name__}")
     return results
 
 
@@ -463,7 +515,7 @@ if __name__ == "__main__":
         print("[ERROR] No valid result files found!")
         sys.exit(1)
     
-    # Load results from all files; auto-route per-k vs flat-list formats
+    # Load results from all files; auto-route per-k / multi-series / flat-list
     flat_datasets: list[tuple[str, list]] = []
     per_k_datasets: list[tuple[str, dict, str]] = []
     print(f"\nLoading {len(valid_files)} result file(s)...")
@@ -476,8 +528,17 @@ if __name__ == "__main__":
         results = load_results_any(filepath)
         if is_per_k_results(results):
             per_k_datasets.append((label, results, str(filepath)))
-        else:
+        elif is_multi_series_results(results):
+            # Expand {setting: [(e1,e2,stats), ...]} into one flat series each
+            for key, series_results in results.items():
+                if not series_results:
+                    continue
+                flat_datasets.append((series_label(key, label), series_results))
+        elif isinstance(results, list):
             flat_datasets.append((label, results))
+        else:
+            print(f"[ERROR] Unsupported results format in {filepath}: {type(results).__name__}")
+            sys.exit(1)
     
     # Plot
     print(f"\n{'='*70}")
@@ -517,14 +578,44 @@ if __name__ == "__main__":
             title_suffix=f"{label} (1 surface per k)",
             plot_path=f"{plot_stem}.png",
         )
-    elif len(flat_datasets) == 1:
-        # Single dataset - use original plotting function
-        print("Single protocol - using standard plot")
-        plot_stats(flat_datasets[0][1])
-    else:
-        # Multiple flat datasets - use comparison plotting function
-        print(f"Comparing {len(flat_datasets)} protocols")
-        plot_stats_comparison(flat_datasets)
+    elif len(flat_datasets) >= 1:
+        # One or more flat / multi-series datasets - SR-style view
+        # (eps1 left, eps2 right, Z right; both eps increase toward the back).
+        # Always use plot_compare — even for a single series — so single-key
+        # pickles like sr_arq_mp_results.pkl don't fall back to plot_stats'
+        # old azim=45 orientation.
+        n = len(flat_datasets)
+        print(
+            f"{'Single protocol' if n == 1 else f'Comparing {n} protocols/series'}"
+            " - using SR-style plot"
+        )
+        colors = [
+            "tab:purple", "tab:red", "tab:blue", "tab:green",
+            "tab:orange", "tab:brown", "tab:pink", "tab:gray",
+        ]
+        series = []
+        eps1_vals: set[float] = set()
+        eps2_vals: set[float] = set()
+        for idx, (label, results) in enumerate(flat_datasets):
+            agg = _snap_agg_keys(sr_aggregate(results))
+            series.append((label, agg, colors[idx % len(colors)]))
+            for e1, e2 in agg:
+                eps1_vals.add(e1)
+                eps2_vals.add(e2)
+        e1_sorted = sorted(eps1_vals)
+        e2_sorted = sorted(eps2_vals)
+        labels_blob = " vs ".join(lbl for lbl, _ in flat_datasets)
+        plot_stem = "protocol_comparison_3d"
+        if len(valid_files) == 1:
+            plot_stem = os.path.splitext(os.path.basename(valid_files[0]))[0]
+        sr_plot_compare(
+            series,
+            e1_sorted,
+            e2_sorted,
+            title_suffix=f"Comparison: {labels_blob}",
+            plot_path=f"{plot_stem}.png",
+            std_for=series[-1][0] if series else None,
+        )
     
     print(f"\n{'='*70}")
     print("Plots saved successfully!")
