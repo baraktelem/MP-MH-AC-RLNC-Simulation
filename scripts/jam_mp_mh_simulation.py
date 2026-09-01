@@ -455,7 +455,12 @@ def plot_per_k_surfaces(
         ax.set_zlabel(metric_label)
         ax.set_title(f"{metric_label} (1 surface per k)")
         ax.set_zlim(0, max(0.1, max_z * 1.1))
-        ax.view_init(elev=20, azim=45)
+        # Match sr_arq_mpmh_simulation.py's orientation (plot_compare in
+        # sr_arq_simulation.py): shallower pitch and both eps axes inverted, so the
+        # low-eps corner faces the viewer and eps1/eps2 both ascend left-to-right.
+        ax.view_init(elev=10, azim=-45)
+        ax.invert_xaxis()
+        ax.invert_yaxis()
         ax.legend(handles=legend_patches, fontsize=8, loc="upper left")
 
     fig.suptitle(title_suffix, fontsize=12, fontweight="bold")

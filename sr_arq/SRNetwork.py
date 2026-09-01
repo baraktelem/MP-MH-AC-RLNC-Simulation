@@ -194,7 +194,7 @@ class SRMpMhNetwork(MhNetwork):
         self.paths: list[list[Path]] = [[] for _ in range(num_paths)]
         for c in range(num_paths):
             for h in range(num_hops):
-                path = Path(self.hop_prop_delay, path_epsilons[c][h], h, c, debug=self.debug)
+                path = self._make_path(self.hop_prop_delay, path_epsilons[c][h], h, c)
                 path.set_global_path_index(c + 1)
                 self.paths[c].append(path)
 
@@ -260,6 +260,12 @@ class SRMpMhNetwork(MhNetwork):
             e2e_rtt=self.global_rtt,
             debug=self.debug,
         )
+
+    def _make_path(self, prop_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int) -> Path:
+        """Factory for one forward path. Overridden by SRJamMpMhNetwork to build a
+        JamPath (a Path whose forward channel a Jammer can block) instead of a
+        plain Path, so the jammed topology reuses this __init__ verbatim."""
+        return Path(prop_delay, epsilon, hop_index, path_index_in_hop, debug=self.debug)
 
     def _tick(self):
         # Explicit order: source -> nodes (hop-major) -> receiver.
