@@ -698,7 +698,7 @@ def _run_main() -> None:
     #   SRFeedbackMode.E2E_FORWARD_ONLY -> forward-only relays, slot-based E2E
     #   SRFeedbackMode.E2E_FULL_ARQ     -> full per-hop SR-ARQ relays, seq-based E2E
     #   SRFeedbackMode.E2E_TIMEOUT      -> forward-only relays, ACK-only E2E + source timeout
-    SR_FEEDBACK_MODE = SRFeedbackMode.E2E_FORWARD_ONLY
+    SR_FEEDBACK_MODE = SRFeedbackMode.HBH
     _FB_TAG = SR_FEEDBACK_MODE.name
 
     # Window sizing: HBH runs an independent SR-ARQ per hop (per-hop RTT drives the

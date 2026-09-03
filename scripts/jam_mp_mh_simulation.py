@@ -984,12 +984,13 @@ def mode_sweep_eps_grid_per_k(
             per_k_results[group_key].append((e1, e2, stats))
             per_k_complete[group_key] += 1
             completed += 1
-            print(
-                f"[{completed}/{total}] k={k:>2} iter {it}/{num_iterations} "
-                f"e1={e1:.1f} e2={e2:.1f} -> "
-                f"tp={stats.normalized_throughput:.4f} "
-                f"delay_mean={stats.inorder_delay_mean:.2f}"
-            )
+            if completed % 50 == 0 or completed == total or completed <= parallel_workers:
+                print(
+                    f"[{completed}/{total}] k={k:>2} iter {it}/{num_iterations} "
+                    f"e1={e1:.1f} e2={e2:.1f} -> "
+                    f"tp={stats.normalized_throughput:.4f} "
+                    f"delay_mean={stats.inorder_delay_mean:.2f}"
+                )
             if per_k_complete[group_key] == per_k_target_count:
                 save_pickle(per_k_results, results_file, prefix="jam_sweep_eps_grid_per_k")
                 print(f"[checkpoint] k={group_key} complete -> saved partial pickle")
