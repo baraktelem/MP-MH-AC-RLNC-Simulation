@@ -5,13 +5,17 @@ Results Analyzer GUI
 A small Tkinter desktop app for eyeballing jammed-grid simulation results.
 
 Give it:
-  * a list of result pickles (the sweep_eps_grid_per_k files:
-    dict[k -> list[(e1, e2, SimulationStats)]]), and
+  * a list of result pickles. Both jammed-grid sweep families are supported,
+    since they share the same layout dict[key -> list[(e1, e2, SimulationStats)]]:
+      - sweep_eps_grid_per_k     (key = jammer k),   and
+      - sweep_eps_grid_per_alpha (key = jammer alpha).
+    The series kind (k vs alpha) is inferred from the filename, so mixing the two
+    in one session keeps them on separate tabs (no k=12 / alpha=12 collision), and
   * a list of (eps1, eps2) operating points,
 
-and it shows ONE sortable table per jammer level k (as Notebook tabs) with
-throughput, mean in-order delay and max in-order delay (mean over the stored
-iterations) for every (file x eps) row.
+and it shows ONE sortable table per series level (jammer k, or jammer alpha) as
+Notebook tabs with throughput, mean in-order delay and max in-order delay (mean
+over the stored iterations) for every (file x eps) row.
 
 Run:
     python scripts/analyze_results_gui.py
@@ -77,13 +81,25 @@ def _get(stats, *names):
     return None
 
 
+def series_kind_for_file(path) -> str:
+    """Series dimension of a numeric-keyed surface pickle, inferred from filename.
+
+    sweep_eps_grid_per_alpha pickles -> 'α'; everything else (sweep_eps_grid_per_k,
+    multi-series, flat) -> 'k'. Per-k and per-alpha pickles are structurally
+    identical (dict of numeric key -> [(e1, e2, stats), ...]), so the filename is
+    the only signal -- same convention as scripts/plot_saved_results.py.
+    """
+    stem = os.path.splitext(os.path.basename(str(path)))[0].lower()
+    return "α" if ("per_alpha" in stem or "sweep_alpha" in stem) else "k"
+
+
 def load_file(path):
-    """Load one results pickle into {k_label: [(e1, e2, stats), ...]}.
+    """Load one results pickle into {series_value: [(e1, e2, stats), ...]}.
 
     Tolerant to the three shapes plot_saved_results.py recognises:
-      * dict with int keys   -> per-k grid (the jam sweep_eps_grid_per_k files)
-      * dict with str keys   -> multi-series; the series name is used as the label
-      * list                 -> a single flat group, labelled "-"
+      * dict with numeric keys -> per-k or per-alpha grid (jam sweep_eps_grid_*)
+      * dict with str keys     -> multi-series; the series name is used as the label
+      * list                   -> a single flat group, labelled "-"
     """
     with open(path, "rb") as f:
         obj = pickle.load(f)
@@ -100,9 +116,10 @@ def load_file(path):
 def aggregate_files(paths):
     """Return (records, all_k, errors).
 
-    records[(path, k, e1, e2)] = {tp_mean, tp_std, dm_mean, dm_std, dx_mean,
-                                  dx_std, good_mean, dec_mean, t_mean, n}
-    all_k   = set of every k label seen
+    records[(path, kk, e1, e2)] = {tp_mean, tp_std, dm_mean, dm_std, dx_mean,
+                                   dx_std, good_mean, dec_mean, t_mean, n}
+    all_k   = set of every series key seen, each a (kind, value) tuple where
+              kind is 'k' or 'α' (so per-k and per-alpha levels never collide)
     errors  = {path: message} for files that failed to load
     """
     records = {}
@@ -114,8 +131,10 @@ def aggregate_files(paths):
         except Exception as exc:  # surface any load failure to the UI
             errors[path] = str(exc)
             continue
+        kind = series_kind_for_file(path)
         for k, rows in groups.items():
-            all_k.add(k)
+            kk = (kind, k)  # tag the level with its series kind (k vs alpha)
+            all_k.add(kk)
             buck = defaultdict(lambda: {"tp": [], "dm": [], "dx": [], "good": [], "dec": [], "t": []})
             for item in rows:
                 try:
@@ -136,7 +155,7 @@ def aggregate_files(paths):
                 dm = np.asarray(b["dm"], float)
                 dx = np.asarray(b["dx"], float)
                 good = np.asarray(b["good"], float)
-                records[(path, k, e1, e2)] = {
+                records[(path, kk, e1, e2)] = {
                     "tp_mean": float(tp.mean()), "tp_std": float(tp.std()),
                     "dm_mean": float(dm.mean()), "dm_std": float(dm.std()),
                     "dx_mean": float(dx.mean()), "dx_std": float(dx.std()),
@@ -161,9 +180,14 @@ def parse_eps(text):
     return [(round(nums[i], 2), round(nums[i + 1], 2)) for i in range(0, len(nums) - 1, 2)]
 
 
-def _k_sort_key(k):
-    """Sort int/float k values numerically first, then any string labels."""
-    return (0, k) if isinstance(k, (int, float)) else (1, str(k))
+def _k_sort_key(kk):
+    """Sort (kind, value) series keys: group by kind (k before alpha), then
+    numeric values first, then any string labels."""
+    kind, val = kk
+    kind_rank = 0 if kind == "k" else 1
+    if isinstance(val, (int, float)):
+        return (kind_rank, 0, float(val))
+    return (kind_rank, 1, str(val))
 
 
 # ---------------------------------------------------------------------------
@@ -383,21 +407,21 @@ class AnalyzerApp(tk.Tk):
         b = os.path.basename(path)
         return b if len(b) <= 30 else b[:14] + "..." + b[-14:]
 
-    def _diag_series(self, k, loaded_paths):
-        """Diagonal (e1 == e2) sweep for one k.
+    def _diag_series(self, kk, loaded_paths):
+        """Diagonal (e1 == e2) sweep for one series level kk = (kind, value).
 
         Returns (xs, {path: {"tp": [...], "dm": [...], "dx": [...]}}) with each
         y-list aligned to xs (NaN where a file lacks that eps point). Independent
-        of the eps text box: always uses every eps1 == eps2 present for this k.
+        of the eps text box: always uses every eps1 == eps2 present for this level.
         """
-        diag = sorted({e1 for (p, kk, e1, e2) in self.records
-                       if kk == k and abs(e1 - e2) < 1e-9})
+        diag = sorted({e1 for (p, rk, e1, e2) in self.records
+                       if rk == kk and abs(e1 - e2) < 1e-9})
         series = {}
         for p in loaded_paths:
             ys = {"tp": [], "dm": [], "dx": []}
             has_any = False
             for e in diag:
-                rec = self.records.get((p, k, e, e))
+                rec = self.records.get((p, kk, e, e))
                 if rec is None:
                     ys["tp"].append(float("nan"))
                     ys["dm"].append(float("nan"))
@@ -411,16 +435,16 @@ class AnalyzerApp(tk.Tk):
                 series[p] = ys
         return diag, series
 
-    def _make_graph(self, parent, k, loaded_paths):
+    def _make_graph(self, parent, kk, loaded_paths):
         """Frame holding a 3-subplot figure (throughput / mean delay / max delay)
         vs eps (e1 = e2), one line per pickle, all overlaid on shared axes."""
         frame = ttk.Frame(parent)
-        diag, series = self._diag_series(k, loaded_paths)
+        diag, series = self._diag_series(kk, loaded_paths)
         if not _HAVE_MPL:
             ttk.Label(frame, text="matplotlib not available - graphs disabled").pack(pady=8)
             return frame
         if not diag or not series:
-            ttk.Label(frame, text="No eps1 = eps2 diagonal points for this k.").pack(pady=8)
+            ttk.Label(frame, text="No eps1 = eps2 diagonal points for this level.").pack(pady=8)
             return frame
 
         fig = Figure(figsize=(9.5, 3.3), dpi=100)
@@ -439,7 +463,8 @@ class AnalyzerApp(tk.Tk):
         handles, labels = fig.axes[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="lower center",
                    ncol=max(1, min(len(labels), 3)), fontsize=7, frameon=False)
-        fig.suptitle(f"k = {k}   (eps1 = eps2 sweep)", fontsize=10)
+        kind, val = kk
+        fig.suptitle(f"{kind} = {val}   (eps1 = eps2 sweep)", fontsize=10)
         fig.tight_layout(rect=(0, 0.1, 1, 0.94))
 
         canvas = FigureCanvasTkAgg(fig, master=frame)
@@ -482,10 +507,10 @@ class AnalyzerApp(tk.Tk):
                 self._status("No valid (eps1,eps2) tuples. Example: (0.1,0.1),(0.4,0.4)")
                 return
 
-        present_pk = {(p, k) for (p, k, _e1, _e2) in self.records}
+        present_pk = {(p, kk) for (p, kk, _e1, _e2) in self.records}
         eps_by_pk = defaultdict(set)
-        for (p, k, e1, e2) in self.records:
-            eps_by_pk[(p, k)].add((e1, e2))
+        for (p, kk, e1, e2) in self.records:
+            eps_by_pk[(p, kk)].add((e1, e2))
 
         columns = self._columns()
         try:
@@ -501,37 +526,38 @@ class AnalyzerApp(tk.Tk):
         loaded_paths = [p for p in self.files if p not in errors]
         total = 0
         skipped = 0
-        for k in ks:
+        for kk in ks:
+            kind, val = kk
             tab = ttk.Frame(self.notebook)
-            self.notebook.add(tab, text=f"k = {k}")
+            self.notebook.add(tab, text=f"{kind} = {val}")
             paned = ttk.Panedwindow(tab, orient="vertical")
             paned.pack(fill="both", expand=True)
-            graph_frame = self._make_graph(paned, k, loaded_paths)
+            graph_frame = self._make_graph(paned, kk, loaded_paths)
             tree_frame, tree = self._make_tree(paned, columns)
             paned.add(graph_frame, weight=3)
             paned.add(tree_frame, weight=4)
-            self._trees[k] = tree
+            self._trees[kk] = tree
             for path in loaded_paths:
-                if (path, k) not in present_pk:
-                    continue  # this file simply has no such k
+                if (path, kk) not in present_pk:
+                    continue  # this file simply has no such level
                 label = os.path.basename(path)
-                eps_list = sorted(eps_by_pk[(path, k)]) if req_eps is None else req_eps
+                eps_list = sorted(eps_by_pk[(path, kk)]) if req_eps is None else req_eps
                 for (e1, e2) in eps_list:
-                    rec = self.records.get((path, k, e1, e2))
+                    rec = self.records.get((path, kk, e1, e2))
                     if rec is None:
                         skipped += 1
                         continue
                     tree.insert("", "end", values=self._row_values(label, e1, e2, rec, columns))
-                    self._built.append((k, path, e1, e2))
+                    self._built.append((kk, path, e1, e2))
                     total += 1
 
         tabs = self.notebook.tabs()
         if tabs:
             self.notebook.select(min(prev_index, len(tabs) - 1))
 
-        msg = f"{len(loaded_paths)} file(s)  -  {len(ks)} k tab(s)  -  {total} rows"
+        msg = f"{len(loaded_paths)} file(s)  -  {len(ks)} level tab(s)  -  {total} rows"
         if skipped:
-            msg += f"  -  {skipped} (file,k,eps) combos had no data"
+            msg += f"  -  {skipped} (file,level,eps) combos had no data"
         if errors:
             msg += f"  -  {len(errors)} file(s) failed to load"
         self._status(msg)
@@ -550,19 +576,20 @@ class AnalyzerApp(tk.Tk):
         if not path:
             return
         header = [
-            "k", "file", "eps1", "eps2",
+            "series", "level", "file", "eps1", "eps2",
             "throughput", "throughput_std",
             "mean_delay", "mean_delay_std",
             "max_delay", "max_delay_std",
             "goodput", "decoded", "t_mean", "n",
         ]
-        with open(path, "w", newline="") as f:
+        with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(header)
-            for (k, p, e1, e2) in self._built:
-                r = self.records[(p, k, e1, e2)]
+            for (kk, p, e1, e2) in self._built:
+                kind, val = kk
+                r = self.records[(p, kk, e1, e2)]
                 w.writerow([
-                    k, os.path.basename(p), e1, e2,
+                    kind, val, os.path.basename(p), e1, e2,
                     r["tp_mean"], r["tp_std"],
                     r["dm_mean"], r["dm_std"],
                     r["dx_mean"], r["dx_std"],

@@ -21,8 +21,12 @@ top of _run_main:
                                    comparable to mp_mh_simulation.py's
                                    output (same axes, same convention).
 
-    MODE = "sweep_alpha"         - sweep jammer_alpha for fixed (epsilon, k)
-                                   and plot the same three metrics vs alpha.
+    MODE = "sweep_eps_grid_per_alpha" - sweep (e1, e2) over the same 8x8 grid
+                                   as sweep_eps_grid_per_k for each jammer_alpha
+                                   (jammer_k fixed), and plot one 3D surface
+                                   per alpha on each of the three metric
+                                   subplots. The alpha analog of
+                                   sweep_eps_grid_per_k.
 
     MODE = "validate_k0"         - at jammer_k = 0, run JamMpMhNetwork and
                                    MpMhNetwork on the same epsilon matrix
@@ -37,8 +41,12 @@ Recommended parameter sweeps:
   - sweep_eps_grid_per_k: EPS_GRID_VALUES = np.arange(0.1, 0.9, 0.1) and a
     handful of k values (e.g., [0, 2, 4, 6, 8, 10, 12]). NUM_ITERATIONS=10-20
     keeps total runtime tractable (sims = 64 * len(K) * NUM_ITERATIONS).
-  - sweep_alpha: ALPHA_VALUES = [1, 2, 3, 4, 6, 12]. Higher alpha means
-    shorter jamming rounds (RTT/alpha).
+  - sweep_eps_grid_per_alpha: runs the full (e1, e2) grid per alpha (one 3D
+    surface each).
+    Higher alpha means shorter jamming rounds (jamming_round_time = RTT/alpha);
+    values that divide RTT (e.g. [1, 2, 3, 4, 6, 12] for RTT=12) give integer
+    round lengths. Keep alpha in [1, RTT]: alpha > RTT rounds below one slot
+    (degenerate) and alpha < 1 makes the round longer than an RTT.
   - validate_k0: NUM_ITERATIONS ~ 50, paper template at e1=0.1 e2=0.2.
 
 Run:
@@ -368,26 +376,34 @@ def plot_sweep_multi(
 
 
 def plot_per_k_surfaces(
-    aggregated_per_k: dict[int, dict[tuple[float, float], dict]],
+    aggregated_per_k: dict,
     *,
     eps_values_e1: list[float],
     eps_values_e2: list[float],
     title_suffix: str,
     plot_path: str,
+    series_label: str = "k",
+    series_fmt=None,
     capacity_func=None,
     capacity_label: str = "Chain min-cut capacity",
     capacity_color: str = "red",
 ) -> None:
     """Three 3D subplots (throughput / mean delay / max delay). Each subplot
-    overlays one alpha-blended surface per k value (distinct color per k)
-    on the same (eps1, eps2) base grid. Mirrors mp_mh_simulation.py's
+    overlays one alpha-blended surface per series value (distinct color per
+    value) on the same (eps1, eps2) base grid. Mirrors mp_mh_simulation.py's
     surface style so JamMpMhNetwork(k=0) can be visually compared against
     MpMhNetwork output produced by mp_mh_simulation.py.
+
+    `aggregated_per_k` maps a series value (k for sweep_eps_grid_per_k, alpha
+    for sweep_eps_grid_per_alpha) to {(e1, e2): metric-dict}. `series_label` is the legend /
+    title noun ("k" or "α"); `series_fmt` optionally formats each value for the
+    legend (defaults to str()).
 
     capacity_func (optional): callable (e1, e2) -> float that returns a
     capacity bound. Plotted as a transparent reference surface ON THE
     THROUGHPUT SUBPLOT ONLY. For JamMpMhNetwork, pass `chain_min_cut_capacity`.
     """
+    fmt = series_fmt or (lambda v: f"{v}")
     n_e1 = len(eps_values_e1)
     n_e2 = len(eps_values_e2)
     EPS1, EPS2 = np.meshgrid(eps_values_e1, eps_values_e2)
@@ -427,7 +443,7 @@ def plot_per_k_surfaces(
             )
 
         legend_patches = [
-            Patch(color=color_for(i), label=f"k={k}", alpha=0.4)
+            Patch(color=color_for(i), label=f"{series_label}={fmt(k)}", alpha=0.4)
             for i, k in enumerate(sorted_ks)
         ]
 
@@ -453,7 +469,7 @@ def plot_per_k_surfaces(
         ax.set_xlabel("ε₁")
         ax.set_ylabel("ε₂")
         ax.set_zlabel(metric_label)
-        ax.set_title(f"{metric_label} (1 surface per k)")
+        ax.set_title(f"{metric_label} (1 surface per {series_label})")
         ax.set_zlim(0, max(0.1, max_z * 1.1))
         # Match sr_arq_mpmh_simulation.py's orientation (plot_compare in
         # sr_arq_simulation.py): shallower pitch and both eps axes inverted, so the
@@ -650,10 +666,9 @@ def mode_sweep_k(
     )
 
 
-def mode_sweep_alpha(
+def mode_sweep_eps_grid_per_alpha(
     *,
-    e1: float,
-    e2: float,
+    eps_values: list[float],
     num_paths: int,
     num_hops: int,
     rtt: int,
@@ -669,50 +684,113 @@ def mode_sweep_alpha(
     plot_file: str,
     load_existing: bool,
     feedback_source: FeedbackSource,
+    parallel_workers: int = 1,
 ) -> None:
+    """Sweep (e1, e2) over the eps_values x eps_values grid for each alpha in
+    alpha_values (jammer_k fixed), and plot one 3D surface per alpha overlaid on
+    the same (eps1, eps2) plane for throughput / mean delay / max delay. This is
+    the alpha analog of mode_sweep_eps_grid_per_k (alpha is the series dimension
+    instead of k). Pickle is checkpointed after each alpha completes."""
+    eps_sorted = sorted(eps_values)
+
     if load_existing and os.path.exists(results_file):
-        results = load_pickle(results_file)
+        per_alpha_results = load_pickle(results_file)
     else:
-        eps = chain_major_epsilons(e1, e2, num_hops)
-        results: list[tuple[int, SimulationStats]] = []
-        total = num_iterations * len(alpha_values)
-        sim = 0
-        for it in range(1, num_iterations + 1):
-            for alpha in alpha_values:
-                sim += 1
-                stats = run_jam_network(
-                    path_eps_chain_major=eps,
-                    num_paths=num_paths,
-                    num_hops=num_hops,
-                    rtt=rtt,
-                    threshold=threshold,
-                    o_bar=o_bar,
-                    num_packets_to_send=num_packets_to_send,
-                    max_iterations=max_iterations,
-                    jammer_alpha=alpha,
-                    jammer_k=jammer_k,
-                    initial_epsilon=initial_epsilon,
-                    debug=False,
-                    feedback_source=feedback_source,
-                )
-                results.append((alpha, stats))
+        per_alpha_target_count = num_iterations * len(eps_sorted) ** 2
+        tasks: list[tuple] = []
+        for alpha in alpha_values:
+            for it in range(1, num_iterations + 1):
+                for e1 in eps_sorted:
+                    for e2 in eps_sorted:
+                        tasks.append((
+                            alpha,                   # group_key = alpha
+                            jammer_k,
+                            float(e1),
+                            float(e2),
+                            it,
+                            alpha,
+                            num_paths,
+                            num_hops,
+                            rtt,
+                            threshold,
+                            o_bar,
+                            num_packets_to_send,
+                            max_iterations,
+                            initial_epsilon,
+                            feedback_source,
+                        ))
+
+        per_alpha_results: dict[float, list[tuple[float, float, SimulationStats]]] = {
+            alpha: [] for alpha in alpha_values
+        }
+        per_alpha_complete: dict[float, int] = {alpha: 0 for alpha in alpha_values}
+        total = len(tasks)
+        completed = 0
+
+        for _, result in _execute_tasks(
+            tasks,
+            parallel_workers=parallel_workers,
+            progress_label="sweep_eps_grid_per_alpha",
+        ):
+            (group_key, _k, e1, e2, it, alpha, stats) = result
+            per_alpha_results[group_key].append((e1, e2, stats))
+            per_alpha_complete[group_key] += 1
+            completed += 1
+            if completed % 50 == 0 or completed == total or completed <= parallel_workers:
                 print(
-                    f"[{sim}/{total}] iter {it}/{num_iterations} alpha={alpha:>2} "
-                    f"-> tp={stats.normalized_throughput:.4f} "
+                    f"[{completed}/{total}] alpha={alpha:>7.3g} iter {it}/{num_iterations} "
+                    f"e1={e1:.1f} e2={e2:.1f} -> "
+                    f"tp={stats.normalized_throughput:.4f} "
                     f"delay_mean={stats.inorder_delay_mean:.2f}"
                 )
-        save_pickle(results, results_file, prefix="jam_sweep_alpha")
+            if per_alpha_complete[group_key] == per_alpha_target_count:
+                save_pickle(per_alpha_results, results_file, prefix="jam_sweep_eps_grid_per_alpha")
+                print(f"[checkpoint] alpha={group_key} complete -> saved partial pickle")
 
-    aggregated = aggregate_by_key(results)
-    plot_sweep(
-        aggregated,
-        x_label="Jammer alpha (jamming round = RTT/alpha)",
+        save_pickle(per_alpha_results, results_file, prefix="jam_sweep_eps_grid_per_alpha")
+
+    aggregated_per_alpha: dict[float, dict[tuple[float, float], dict]] = {}
+    for alpha, results in per_alpha_results.items():
+        grouped: defaultdict = defaultdict(
+            lambda: {"throughput": [], "delay_mean": [], "delay_max": []}
+        )
+        for e1, e2, stats in results:
+            grouped[(float(e1), float(e2))]["throughput"].append(stats.normalized_throughput)
+            grouped[(float(e1), float(e2))]["delay_mean"].append(stats.inorder_delay_mean)
+            grouped[(float(e1), float(e2))]["delay_max"].append(stats.inorder_delay_max)
+        aggregated_per_alpha[alpha] = {
+            key: {
+                "throughput_mean": float(np.mean(v["throughput"])),
+                "throughput_std": float(np.std(v["throughput"])),
+                "delay_mean_mean": float(np.mean(v["delay_mean"])),
+                "delay_mean_std": float(np.std(v["delay_mean"])),
+                "delay_max_mean": float(np.mean(v["delay_max"])),
+                "delay_max_std": float(np.std(v["delay_max"])),
+                "n": len(v["throughput"]),
+            }
+            for key, v in grouped.items()
+        }
+
+    # Same NetworkX min-cut reference as sweep_eps_grid_per_k (throughput subplot).
+    capacity_func = None
+    capacity_label = "Min-cut capacity"
+    if _mp_mh_min_cut is not None:
+        capacity_func = lambda e1, e2: float(_mp_mh_min_cut(e1, e2, num_hops))
+        capacity_label = "Min-cut capacity (NetworkX, layered BEC)"
+
+    plot_per_k_surfaces(
+        aggregated_per_alpha,
+        eps_values_e1=eps_sorted,
+        eps_values_e2=eps_sorted,
+        series_label="α",
+        series_fmt=lambda a: f"{a:g} (round≈{rtt / a:g})",
         title_suffix=(
-            f"JamMpMhNetwork sweep_alpha (H={num_hops}, P={num_paths}, "
-            f"k={jammer_k}, RTT={rtt}, eps_template e1={e1} e2={e2}, "
-            f"feedback={feedback_source.name})"
+            f"JamMpMhNetwork sweep_eps_grid_per_alpha (H={num_hops}, P={num_paths}, "
+            f"k={jammer_k}, RTT={rtt}, feedback={feedback_source.name}); one surface per alpha"
         ),
         plot_path=plot_file,
+        capacity_func=capacity_func,
+        capacity_label=capacity_label,
     )
 
 
@@ -1067,20 +1145,20 @@ def _run_main() -> None:
     EPS_E2 = 0.2
 
     # ---- Mode selection --------------------------------------------------
-    MODE = "sweep_eps_grid_per_k"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_alpha", "validate_k0"
+    MODE = "sweep_eps_grid_per_alpha"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_eps_grid_per_alpha", "validate_k0"
     LOAD_EXISTING = False
 
     # ---- Feedback source selection ---------------------------------------
     # FeedbackSource.HBH (hop-by-hop) or FeedbackSource.E2E (end-to-end).
     # Mirrors scripts/mp_mh_simulation.py. The name is appended to every
     # results/plot filename so E2E and HBH outputs never collide.
-    FEEDBACK_SOURCE = FeedbackSource.HBH
+    FEEDBACK_SOURCE = FeedbackSource.E2E
     _FB_TAG = FEEDBACK_SOURCE.name  # "E2E" or "HBH"
 
     # Parallelization for the heavy sweep modes (sweep_k, sweep_k_multi_eps,
-    # sweep_eps_grid_per_k). 1 = serial. A safe default is os.cpu_count() // 2
-    # to leave headroom for the OS / other apps. Set to os.cpu_count() to use
-    # every core. Has no effect on sweep_alpha / validate_k0.
+    # sweep_eps_grid_per_k, sweep_eps_grid_per_alpha). 1 = serial. A safe default is
+    # os.cpu_count() // 2 to leave headroom for the OS / other apps. Set to
+    # os.cpu_count() to use every core. Has no effect on validate_k0.
     PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
 
     # sweep_k config
@@ -1109,14 +1187,14 @@ def _run_main() -> None:
     EPS_GRID_RESULTS_FILE = f"jam_sweep_eps_grid_per_k_results_{_FB_TAG}.pkl"
     EPS_GRID_PLOT_FILE = f"jam_sweep_eps_grid_per_k_{_FB_TAG}.png"
 
-    # sweep_alpha config
-    ALPHA_VALUES: list[int] = [1, 2, 3, 4, 6, 12]
-    SWEEP_ALPHA_K = 2
-    ALPHA_RESULTS_FILE = f"jam_sweep_alpha_results_{_FB_TAG}.pkl"
-    ALPHA_PLOT_FILE = f"jam_sweep_alpha_{_FB_TAG}.png"
+    # sweep_eps_grid_per_alpha config
+    ALPHA_VALUES: list[int] = [RTT, 1, 0.5, 0.1]
+    SWEEP_ALPHA_K = 3
+    ALPHA_RESULTS_FILE = f"jam_sweep_eps_grid_per_alpha_results_rtt_{RTT}_k_{SWEEP_ALPHA_K}_{_FB_TAG}.pkl"
+    ALPHA_PLOT_FILE = f"jam_sweep_eps_grid_per_alpha_rtt_{RTT}_k_{SWEEP_ALPHA_K}_{_FB_TAG}.png"
 
     # validate_k0 config
-    VALIDATE_RESULTS_FILE = f"jam_validate_k0_results_{_FB_TAG}.pkl"
+    VALIDATE_RESULTS_FILE = f"jam_validate_k0_results_rtt_{RTT}_k_{SWEEP_ALPHA_K}_{_FB_TAG}.pkl"
 
     print("\nSimulation parameters:")
     print(f"  - RTT (slots): {RTT}, prop_delay: {PROP_DELAY}")
@@ -1190,10 +1268,9 @@ def _run_main() -> None:
             feedback_source=FEEDBACK_SOURCE,
             parallel_workers=PARALLEL_WORKERS,
         )
-    elif MODE == "sweep_alpha":
-        mode_sweep_alpha(
-            e1=EPS_E1,
-            e2=EPS_E2,
+    elif MODE == "sweep_eps_grid_per_alpha":
+        mode_sweep_eps_grid_per_alpha(
+            eps_values=EPS_GRID_VALUES,
             num_paths=NUM_PATHS,
             num_hops=NUM_HOPS,
             rtt=RTT,
@@ -1209,6 +1286,7 @@ def _run_main() -> None:
             plot_file=ALPHA_PLOT_FILE,
             load_existing=LOAD_EXISTING,
             feedback_source=FEEDBACK_SOURCE,
+            parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "validate_k0":
         mode_validate_k0(

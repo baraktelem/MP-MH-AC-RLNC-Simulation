@@ -24,8 +24,11 @@ Modes (selected at the top of _run_main):
                                     each k; one 3D surface per k on each of the
                                     three metric subplots.
 
-    MODE = "sweep_alpha"          - sweep jammer_alpha for fixed (epsilon, k) and
-                                    plot the same three metrics vs alpha.
+    MODE = "sweep_eps_grid_per_alpha" - (e1, e2) grid (np.arange(0.1, 0.9, 0.1))
+                                    for each jammer_alpha (jammer_k fixed); one 3D
+                                    surface per alpha on each of the three metric
+                                    subplots. The alpha analog of
+                                    sweep_eps_grid_per_k.
 
     MODE = "validate_k0"          - at jammer_k = 0 run SRJamMpMhNetwork and plain
                                     SRMpMhNetwork on the same epsilon matrix and
@@ -321,10 +324,9 @@ def mode_sweep_k(
     )
 
 
-def mode_sweep_alpha(
+def mode_sweep_eps_grid_per_alpha(
     *,
-    e1: float,
-    e2: float,
+    eps_values: list[float],
     num_paths: int,
     num_hops: int,
     rtt: int,
@@ -343,46 +345,97 @@ def mode_sweep_alpha(
     load_existing: bool,
     parallel_workers: int = 1,
 ) -> None:
-    if load_existing and os.path.exists(results_file):
-        results = load_pickle(results_file)
-    else:
-        tasks: list[tuple] = []
-        for it in range(1, num_iterations + 1):
-            for alpha in alpha_values:
-                # group_key = alpha; k is fixed. The result tuple carries alpha at
-                # index 5, which is what we aggregate on.
-                tasks.append((
-                    alpha, jammer_k, float(e1), float(e2), it, alpha,
-                    num_paths, num_hops, rtt, num_packets_to_send, max_iterations,
-                    window, in_order_forwarding, node_queue_size, packets_per_path,
-                    feedback_mode,
-                ))
+    """Sweep (e1, e2) over the eps_values x eps_values grid for each alpha in
+    alpha_values (jammer_k fixed), and plot one 3D surface per alpha for
+    throughput / mean delay / max delay. The alpha analog of
+    mode_sweep_eps_grid_per_k. Pickle is checkpointed after each alpha completes."""
+    eps_sorted = sorted(eps_values)
 
-        results: list[tuple[int, SimulationStats]] = []
+    if load_existing and os.path.exists(results_file):
+        per_alpha_results = load_pickle(results_file)
+    else:
+        per_alpha_target_count = num_iterations * len(eps_sorted) ** 2
+        tasks: list[tuple] = []
+        for alpha in alpha_values:
+            # group_key = alpha; k is fixed. The result tuple carries alpha at
+            # index 5, which is what we aggregate on.
+            for it in range(1, num_iterations + 1):
+                for e1 in eps_sorted:
+                    for e2 in eps_sorted:
+                        tasks.append((
+                            alpha, jammer_k, float(e1), float(e2), it, alpha,
+                            num_paths, num_hops, rtt, num_packets_to_send, max_iterations,
+                            window, in_order_forwarding, node_queue_size, packets_per_path,
+                            feedback_mode,
+                        ))
+
+        per_alpha_results: dict[float, list[tuple[float, float, SimulationStats]]] = {
+            alpha: [] for alpha in alpha_values
+        }
+        per_alpha_complete: dict[float, int] = {alpha: 0 for alpha in alpha_values}
         total = len(tasks)
         completed = 0
-        for _, result in _execute_tasks(tasks, parallel_workers=parallel_workers, progress_label="sweep_alpha"):
-            (_gk, _k, _e1, _e2, it, alpha, stats) = result
-            results.append((alpha, stats))
+        for _, result in _execute_tasks(tasks, parallel_workers=parallel_workers, progress_label="sweep_eps_grid_per_alpha"):
+            (group_key, _k, e1, e2, it, alpha, stats) = result
+            per_alpha_results[group_key].append((e1, e2, stats))
+            per_alpha_complete[group_key] += 1
             completed += 1
-            if completed % 50 == 0 or completed == total:
+            if completed % 50 == 0 or completed == total or completed <= parallel_workers:
                 print(
-                    f"[{completed}/{total}] iter {it}/{num_iterations} alpha={alpha:>2} "
-                    f"-> tp={stats.normalized_throughput:.4f} "
+                    f"[{completed}/{total}] alpha={alpha:>7.3g} iter {it}/{num_iterations} "
+                    f"e1={e1:.1f} e2={e2:.1f} -> "
+                    f"tp={stats.normalized_throughput:.4f} "
                     f"delay_mean={stats.inorder_delay_mean:.2f}"
                 )
-        save_pickle(results, results_file, prefix="sr_jam_sweep_alpha")
+            if per_alpha_complete[group_key] == per_alpha_target_count:
+                save_pickle(per_alpha_results, results_file, prefix="sr_jam_sweep_eps_grid_per_alpha")
+                print(f"[checkpoint] alpha={group_key} complete -> saved partial pickle")
+        save_pickle(per_alpha_results, results_file, prefix="sr_jam_sweep_eps_grid_per_alpha")
 
-    aggregated = aggregate_by_key(results)
-    plot_sweep(
-        aggregated,
-        x_label="Jammer alpha (jamming round = RTT/alpha)",
+    aggregated_per_alpha: dict[float, dict[tuple[float, float], dict]] = {}
+    for alpha, results in per_alpha_results.items():
+        grouped: defaultdict = defaultdict(
+            lambda: {"throughput": [], "delay_mean": [], "delay_max": []}
+        )
+        for e1, e2, stats in results:
+            grouped[(float(e1), float(e2))]["throughput"].append(stats.normalized_throughput)
+            grouped[(float(e1), float(e2))]["delay_mean"].append(stats.inorder_delay_mean)
+            grouped[(float(e1), float(e2))]["delay_max"].append(stats.inorder_delay_max)
+        aggregated_per_alpha[alpha] = {
+            key: {
+                "throughput_mean": float(np.mean(v["throughput"])),
+                "throughput_std": float(np.std(v["throughput"])),
+                "delay_mean_mean": float(np.mean(v["delay_mean"])),
+                "delay_mean_std": float(np.std(v["delay_mean"])),
+                "delay_max_mean": float(np.mean(v["delay_max"])),
+                "delay_max_std": float(np.std(v["delay_max"])),
+                "n": len(v["throughput"]),
+            }
+            for key, v in grouped.items()
+        }
+
+    # Min-cut capacity is an AC-RLNC upper bound (SR-ARQ sits well below it); shown
+    # only as a reference ceiling on the throughput subplot when NetworkX is present.
+    capacity_func = None
+    capacity_label = "Min-cut capacity"
+    if _mp_mh_min_cut is not None:
+        capacity_func = lambda e1, e2: float(_mp_mh_min_cut(e1, e2, num_hops))
+        capacity_label = "Min-cut capacity (upper bound; not SR-achievable)"
+
+    plot_per_k_surfaces(
+        aggregated_per_alpha,
+        eps_values_e1=eps_sorted,
+        eps_values_e2=eps_sorted,
+        series_label="α",
+        series_fmt=lambda a: f"{a:g} (round≈{rtt / a:g})",
         title_suffix=(
-            f"SR-ARQ [{feedback_mode.name}] JamMpMh sweep_alpha (H={num_hops}, P={num_paths}, "
-            f"k={jammer_k}, RTT={rtt}, W={window}, eps_template e1={e1} e2={e2}, "
-            f"iof={in_order_forwarding}, nqs={node_queue_size})"
+            f"SR-ARQ [{feedback_mode.name}] JamMpMh sweep_eps_grid_per_alpha "
+            f"(H={num_hops}, P={num_paths}, k={jammer_k}, RTT={rtt}, W={window}, "
+            f"iof={in_order_forwarding}, nqs={node_queue_size}); one surface per alpha"
         ),
         plot_path=plot_file,
+        capacity_func=capacity_func,
+        capacity_label=capacity_label,
     )
 
 
@@ -690,7 +743,7 @@ def _run_main() -> None:
     EPS_E2 = 0.2
 
     # ---- Mode selection --------------------------------------------------
-    MODE = "sweep_eps_grid_per_k"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_alpha", "validate_k0"
+    MODE = "sweep_eps_grid_per_alpha"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_eps_grid_per_alpha", "validate_k0"
     LOAD_EXISTING = False
 
     # ---- SR feedback mode (exactly one per run) --------------------------
@@ -698,13 +751,16 @@ def _run_main() -> None:
     #   SRFeedbackMode.E2E_FORWARD_ONLY -> forward-only relays, slot-based E2E
     #   SRFeedbackMode.E2E_FULL_ARQ     -> full per-hop SR-ARQ relays, seq-based E2E
     #   SRFeedbackMode.E2E_TIMEOUT      -> forward-only relays, ACK-only E2E + source timeout
-    SR_FEEDBACK_MODE = SRFeedbackMode.HBH
+    SR_FEEDBACK_MODE = SRFeedbackMode.E2E_FORWARD_ONLY
     _FB_TAG = SR_FEEDBACK_MODE.name
 
     # Window sizing: HBH runs an independent SR-ARQ per hop (per-hop RTT drives the
     # window); the E2E modes run the SR-ARQ end-to-end at the source (window must
     # span a full end-to-end RTT). Same rule as scripts/sr_arq_mpmh_simulation.py.
-    SR_WINDOW = 2 * (HOP_RTT - 1)
+    if SR_FEEDBACK_MODE.is_e2e():
+        SR_WINDOW = 2 * (RTT - 1)
+    else:
+        SR_WINDOW = 2 * (HOP_RTT - 1)
     # Node forwarding discipline (False = out-of-order relay; True = full SR-ARQ
     # per node / in-order forwarding). Per-relay flow-control buffer
     # (None = unbounded). Equal per-chain new-packet quota (None = use
@@ -726,7 +782,7 @@ def _run_main() -> None:
     # finite MAX_ITERATIONS for any sweep that includes high k.
     MAX_ITERATIONS = None
     PACKETS_PER_PATH = None
-    NUM_PACKETS_TO_SEND = 50
+    NUM_PACKETS_TO_SEND = 500
 
     # Parallelization for the sweep modes. 1 = serial. os.cpu_count() // 2 leaves
     # headroom for the OS. Applies to every mode here.
@@ -767,11 +823,11 @@ def _run_main() -> None:
     EPS_GRID_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_k_results_{_CFG_TAG}_k_9.pkl" #!!
     EPS_GRID_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_k_{_CFG_TAG}_k_9.png" #!!
 
-    # sweep_alpha config
-    ALPHA_VALUES: list[int] = [1, 2, 3, 4, 6, 12]  # divisors of RTT -> integer RTT/alpha
-    SWEEP_ALPHA_K = 2
-    ALPHA_RESULTS_FILE = f"sr_jam_sweep_alpha_results_{_CFG_TAG}.pkl"
-    ALPHA_PLOT_FILE = f"sr_jam_sweep_alpha_{_CFG_TAG}.png"
+    # sweep_eps_grid_per_alpha config
+    ALPHA_VALUES: list[int] = [RTT, 1, 0.5, 0.1]
+    SWEEP_ALPHA_K = 3
+    ALPHA_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_alpha_results_{_CFG_TAG}.pkl"
+    ALPHA_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_alpha_{_CFG_TAG}.png"
 
     # validate_k0 config
     VALIDATE_RESULTS_FILE = f"sr_jam_validate_k0_results_{_CFG_TAG}.pkl"
@@ -824,9 +880,10 @@ def _run_main() -> None:
             results_file=EPS_GRID_RESULTS_FILE, plot_file=EPS_GRID_PLOT_FILE,
             load_existing=LOAD_EXISTING, parallel_workers=PARALLEL_WORKERS,
         )
-    elif MODE == "sweep_alpha":
-        mode_sweep_alpha(
-            e1=EPS_E1, e2=EPS_E2, num_paths=NUM_PATHS, num_hops=NUM_HOPS, rtt=RTT,
+    elif MODE == "sweep_eps_grid_per_alpha":
+        print(f"Running sweep_eps_grid_per_alpha with eps_values: {EPS_GRID_VALUES} and alpha_values: {ALPHA_VALUES}")
+        mode_sweep_eps_grid_per_alpha(
+            eps_values=EPS_GRID_VALUES, num_paths=NUM_PATHS, num_hops=NUM_HOPS, rtt=RTT,
             num_packets_to_send=NUM_PACKETS_TO_SEND, max_iterations=MAX_ITERATIONS,
             jammer_k=SWEEP_ALPHA_K, alpha_values=ALPHA_VALUES, num_iterations=NUM_ITERATIONS,
             window=SR_WINDOW, in_order_forwarding=IN_ORDER_FORWARDING,

@@ -13,6 +13,7 @@ Usage:
 import sys
 import os
 import pickle
+import re
 from pathlib import Path
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,26 +48,50 @@ _SERIES_LABELS = {
 
 
 def is_per_k_results(obj) -> bool:
-    """True when obj is {k: [(e1, e2, stats), ...]} from jam sweep_eps_grid_per_k.
+    """True when obj is {series_value: [(e1, e2, stats), ...]} as saved by the
+    jam surface sweeps: sweep_eps_grid_per_k (int k keys) and
+    sweep_eps_grid_per_alpha (numeric alpha keys, which may be float, e.g. 1/RTT).
+    Both share the same structure; callers distinguish k vs alpha by filename
+    (see series_kind_for_file).
 
     Tolerates empty value lists (a partial pickle written by the incremental
-    per-k save during a run that hasn't yet started one or more k values).
-    Requires at least one k to have non-empty data so the format can be
-    distinguished from arbitrary {int: list} dicts.
+    per-series save during a run that hasn't yet started one or more values).
+    Requires at least one series value to have non-empty data so the format can
+    be distinguished from arbitrary {number: list} dicts.
     """
     if not isinstance(obj, dict) or not obj:
         return False
     saw_any_data = False
     for key, value in obj.items():
-        if not isinstance(key, int) or not isinstance(value, list):
+        # Accept int/float series keys (k or alpha); reject bool (a subclass of int).
+        if isinstance(key, bool) or not isinstance(key, (int, float)):
+            return False
+        if not isinstance(value, list):
             return False
         if not value:
-            continue  # partial pickle: this k hasn't started yet
+            continue  # partial pickle: this series value hasn't started yet
         saw_any_data = True
         first = value[0]
         if not isinstance(first, tuple) or len(first) != 3:
             return False
     return saw_any_data
+
+
+def series_kind_for_file(filepath) -> tuple[str, callable]:
+    """Infer the series dimension of a numeric-keyed surface pickle from its
+    filename. sweep_eps_grid_per_alpha files -> ('α', fmt); everything else
+    (sweep_eps_grid_per_k) -> ('k', str). For alpha files the RTT is parsed from
+    the filename when present so the legend can show the jamming-round length
+    (jamming_round_time = RTT / alpha), matching the live sim plot."""
+    stem = os.path.splitext(os.path.basename(str(filepath)))[0].lower()
+    is_alpha = ("per_alpha" in stem) or ("sweep_alpha" in stem)
+    if not is_alpha:
+        return "k", (lambda v: f"{v}")
+    m = re.search(r"rtt[_]?(\d+)", stem)
+    rtt = int(m.group(1)) if m else None
+    if rtt:
+        return "α", (lambda a: f"{a:g} (round≈{rtt / a:g})")
+    return "α", (lambda a: f"{a:g}")
 
 
 def is_multi_series_results(obj) -> bool:
@@ -109,15 +134,15 @@ def load_results_any(filename: str):
     print(f"[OK] Results loaded from: {filename}")
     if is_per_k_results(results):
         non_empty = {k: v for k, v in results.items() if v}
-        empty_ks = sorted(set(results) - set(non_empty))
+        empty_keys = sorted(set(results) - set(non_empty))
         total = sum(len(v) for v in non_empty.values())
         print(
-            f"     Per-k format: {len(results)} k value(s) "
-            f"({len(non_empty)} non-empty, {len(empty_ks)} empty), "
+            f"     Per-series surface format (per-k / per-alpha): {len(results)} "
+            f"series value(s) ({len(non_empty)} non-empty, {len(empty_keys)} empty), "
             f"{total} total data points"
         )
-        if empty_ks:
-            print(f"     Empty k value(s) (skipped in plot): {empty_ks}")
+        if empty_keys:
+            print(f"     Empty series value(s) (skipped in plot): {empty_keys}")
     elif is_multi_series_results(results):
         non_empty = {k: v for k, v in results.items() if v}
         total = sum(len(v) for v in non_empty.values())
@@ -170,10 +195,12 @@ def plot_per_k_stats(
     title_suffix: str,
     plot_path: str,
     num_hops_eff: int = 3,
+    series_label: str = "k",
+    series_fmt=None,
 ) -> None:
     aggregated_per_k = aggregate_per_k_results(per_k_results)
     if not aggregated_per_k:
-        print("[ERROR] No completed k values to plot.")
+        print(f"[ERROR] No completed {series_label} values to plot.")
         return
     eps1, eps2 = infer_eps_grid(aggregated_per_k)
     # Use the same NetworkX min-cut as mp_mh_simulation.py so the reference
@@ -187,6 +214,8 @@ def plot_per_k_stats(
         aggregated_per_k,
         eps_values_e1=eps1,
         eps_values_e2=eps2,
+        series_label=series_label,
+        series_fmt=series_fmt,
         title_suffix=title_suffix,
         plot_path=plot_path,
         capacity_func=capacity_func,
@@ -290,12 +319,13 @@ def build_overlay_series_and_capacities(
     series: list[tuple[str, dict]] = []
     for label, results in flat_datasets:
         series.append((label, _snap_agg_keys(aggregate_results(results))))
-    for label, per_k_results, _filepath in per_k_datasets:
+    for label, per_k_results, filepath in per_k_datasets:
+        s_label, s_fmt = series_kind_for_file(filepath)
         for k in sorted(per_k_results.keys()):
             if not per_k_results[k]:
                 continue
             agg = _snap_agg_keys(aggregate_results(per_k_results[k]))
-            series.append((f"{label} k={k}", agg))
+            series.append((f"{label} {s_label}={s_fmt(k)}", agg))
 
     # Single shared capacity surface -- the same NetworkX min-cut used by
     # mp_mh_simulation.py. Both protocols share this reference because the
@@ -571,12 +601,16 @@ if __name__ == "__main__":
         )
     elif len(per_k_datasets) == 1:
         label, results, filepath = per_k_datasets[0]
-        print("Single per-k dataset - using overlaid surface plot")
+        s_label, s_fmt = series_kind_for_file(filepath)
+        noun = "alpha" if s_label == "α" else "k"
+        print(f"Single per-{noun} dataset - using overlaid surface plot")
         plot_stem = os.path.splitext(os.path.basename(filepath))[0]
         plot_per_k_stats(
             results,
-            title_suffix=f"{label} (1 surface per k)",
+            title_suffix=f"{label} (1 surface per {s_label})",
             plot_path=f"{plot_stem}.png",
+            series_label=s_label,
+            series_fmt=s_fmt,
         )
     elif len(flat_datasets) >= 1:
         # One or more flat / multi-series datasets - SR-style view
