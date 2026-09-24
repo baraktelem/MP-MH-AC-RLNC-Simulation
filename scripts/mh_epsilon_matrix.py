@@ -30,6 +30,25 @@ def article_matrix_paper(e1: float, e2: float) -> list[list[float]]:
     # return [[e1], [e2], [0.2], [0.8]]
 
 
+def article_matrix_grid(
+    e1: float, e2: float, num_paths: int, num_hops: int
+) -> list[list[float]]:
+    """Cyclically tile the paper 4x3 ε matrix to any num_paths x num_hops.
+
+    Row (path) p uses paper row (p % 4); column (hop) h uses paper column
+    (h % 3). At (num_paths=4, num_hops=3) this returns the paper matrix
+    unchanged. Examples: num_hops=4 -> columns [H1,H2,H3,H1]; num_paths=6 ->
+    rows [P1,P2,P3,P4,P1,P2].
+    """
+    base = article_matrix_paper(e1, e2)
+    n_paths_base = len(base)       # 4
+    n_hops_base = len(base[0])     # 3
+    return [
+        [base[p % n_paths_base][h % n_hops_base] for h in range(num_hops)]
+        for p in range(num_paths)
+    ]
+
+
 def validate_article_matrix(
     article: list[list[float]], num_paths: int, num_hops: int
 ) -> None:

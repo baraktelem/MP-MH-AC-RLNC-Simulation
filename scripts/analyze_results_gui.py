@@ -84,13 +84,20 @@ def _get(stats, *names):
 def series_kind_for_file(path) -> str:
     """Series dimension of a numeric-keyed surface pickle, inferred from filename.
 
-    sweep_eps_grid_per_alpha pickles -> 'α'; everything else (sweep_eps_grid_per_k,
-    multi-series, flat) -> 'k'. Per-k and per-alpha pickles are structurally
-    identical (dict of numeric key -> [(e1, e2, stats), ...]), so the filename is
-    the only signal -- same convention as scripts/plot_saved_results.py.
+    sweep_eps_grid_per_alpha pickles -> 'α'; per_p -> 'P'; per_h -> 'H';
+    everything else (sweep_eps_grid_per_k, multi-series, flat) -> 'k'. Per-k /
+    per-alpha / per-P / per-H pickles are structurally identical (dict of numeric
+    key -> [(e1, e2, stats), ...]), so the filename is the only signal -- same
+    convention as scripts/plot_saved_results.py.
     """
     stem = os.path.splitext(os.path.basename(str(path)))[0].lower()
-    return "α" if ("per_alpha" in stem or "sweep_alpha" in stem) else "k"
+    if "per_alpha" in stem or "sweep_alpha" in stem:
+        return "α"
+    if "per_p" in stem:
+        return "P"
+    if "per_h" in stem:
+        return "H"
+    return "k"
 
 
 def load_file(path):
@@ -181,10 +188,10 @@ def parse_eps(text):
 
 
 def _k_sort_key(kk):
-    """Sort (kind, value) series keys: group by kind (k before alpha), then
+    """Sort (kind, value) series keys: group by kind (k, α, P, H), then
     numeric values first, then any string labels."""
     kind, val = kk
-    kind_rank = 0 if kind == "k" else 1
+    kind_rank = {"k": 0, "α": 1, "P": 2, "H": 3}.get(kind, 9)
     if isinstance(val, (int, float)):
         return (kind_rank, 0, float(val))
     return (kind_rank, 1, str(val))

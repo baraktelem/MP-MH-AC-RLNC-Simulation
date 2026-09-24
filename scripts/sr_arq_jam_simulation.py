@@ -30,6 +30,16 @@ Modes (selected at the top of _run_main):
                                     subplots. The alpha analog of
                                     sweep_eps_grid_per_k.
 
+    MODE = "sweep_eps_grid_per_p" - sweep channels P over P_VALUES (hops/k/alpha
+                                    fixed); one 3D surface per P over the (e1, e2)
+                                    grid. ε matrix = paper 4x3 template tiled
+                                    cyclically to P x H.
+
+    MODE = "sweep_eps_grid_per_h" - sweep hops H over H_VALUES (channels/k/alpha
+                                    fixed); one 3D surface per H. Uses RTT=72 so
+                                    (RTT/2) is divisible by every H in [3,6,9,12];
+                                    the SR window is sized per H.
+
     MODE = "validate_k0"          - at jammer_k = 0 run SRJamMpMhNetwork and plain
                                     SRMpMhNetwork on the same epsilon matrix and
                                     print mean +- std side-by-side (the jam wrapper
@@ -77,6 +87,7 @@ from jam_mp_mh_simulation import (
     _mp_mh_min_cut,
     aggregate_by_key,
     chain_major_epsilons,
+    chain_major_epsilons_grid,
     load_pickle,
     plot_per_k_surfaces,
     plot_sweep,
@@ -197,7 +208,7 @@ def _run_one_sim_task(args: tuple) -> tuple:
         packets_per_path,
         feedback_mode,
     ) = args
-    eps_matrix = chain_major_epsilons(e1, e2, num_hops)
+    eps_matrix = chain_major_epsilons_grid(e1, e2, num_paths, num_hops)
     stats = run_sr_jam_network(
         path_eps_chain_major=eps_matrix,
         num_paths=num_paths,
@@ -436,6 +447,216 @@ def mode_sweep_eps_grid_per_alpha(
         plot_path=plot_file,
         capacity_func=capacity_func,
         capacity_label=capacity_label,
+    )
+
+
+def mode_sweep_eps_grid_per_p(
+    *,
+    eps_values: list[float],
+    p_values: list[int],
+    num_hops: int,
+    rtt: int,
+    num_packets_to_send: int,
+    max_iterations: int,
+    jammer_k: int,
+    jammer_alpha: int,
+    num_iterations: int,
+    window: int | None,
+    in_order_forwarding: bool,
+    node_queue_size: int | None,
+    packets_per_path: int | None,
+    feedback_mode: SRFeedbackMode,
+    results_file: str,
+    plot_file: str,
+    load_existing: bool,
+    parallel_workers: int = 1,
+) -> None:
+    """Sweep the number of channels P over p_values (num_hops, jammer_k,
+    jammer_alpha, window fixed), one 3D surface per P over the (e1, e2) grid.
+    ε matrix = paper 4x3 template tiled cyclically to P x num_hops
+    (chain_major_epsilons_grid). Pickle checkpointed after each P."""
+    eps_sorted = sorted(eps_values)
+
+    if load_existing and os.path.exists(results_file):
+        per_p_results = load_pickle(results_file)
+    else:
+        per_p_target_count = num_iterations * len(eps_sorted) ** 2
+        tasks: list[tuple] = []
+        for P in p_values:
+            for it in range(1, num_iterations + 1):
+                for e1 in eps_sorted:
+                    for e2 in eps_sorted:
+                        tasks.append((
+                            P, jammer_k, float(e1), float(e2), it, jammer_alpha,
+                            P, num_hops, rtt, num_packets_to_send, max_iterations,
+                            window, in_order_forwarding, node_queue_size, packets_per_path,
+                            feedback_mode,
+                        ))
+
+        per_p_results: dict[int, list[tuple[float, float, SimulationStats]]] = {
+            P: [] for P in p_values
+        }
+        per_p_complete: dict[int, int] = {P: 0 for P in p_values}
+        total = len(tasks)
+        completed = 0
+        for _, result in _execute_tasks(tasks, parallel_workers=parallel_workers, progress_label="sweep_eps_grid_per_p"):
+            (group_key, _k, e1, e2, it, _alpha, stats) = result
+            per_p_results[group_key].append((e1, e2, stats))
+            per_p_complete[group_key] += 1
+            completed += 1
+            if completed % 50 == 0 or completed == total or completed <= parallel_workers:
+                print(
+                    f"[{completed}/{total}] P={group_key:>2} iter {it}/{num_iterations} "
+                    f"e1={e1:.1f} e2={e2:.1f} -> "
+                    f"tp={stats.normalized_throughput:.4f} "
+                    f"delay_mean={stats.inorder_delay_mean:.2f}"
+                )
+            if per_p_complete[group_key] == per_p_target_count:
+                save_pickle(per_p_results, results_file, prefix="sr_jam_sweep_eps_grid_per_p")
+                print(f"[checkpoint] P={group_key} complete -> saved partial pickle")
+        save_pickle(per_p_results, results_file, prefix="sr_jam_sweep_eps_grid_per_p")
+
+    aggregated_per_p: dict[int, dict[tuple[float, float], dict]] = {}
+    for P, results in per_p_results.items():
+        grouped: defaultdict = defaultdict(
+            lambda: {"throughput": [], "delay_mean": [], "delay_max": []}
+        )
+        for e1, e2, stats in results:
+            grouped[(float(e1), float(e2))]["throughput"].append(stats.normalized_throughput)
+            grouped[(float(e1), float(e2))]["delay_mean"].append(stats.inorder_delay_mean)
+            grouped[(float(e1), float(e2))]["delay_max"].append(stats.inorder_delay_max)
+        aggregated_per_p[P] = {
+            key: {
+                "throughput_mean": float(np.mean(v["throughput"])),
+                "throughput_std": float(np.std(v["throughput"])),
+                "delay_mean_mean": float(np.mean(v["delay_mean"])),
+                "delay_mean_std": float(np.std(v["delay_mean"])),
+                "delay_max_mean": float(np.mean(v["delay_max"])),
+                "delay_max_std": float(np.std(v["delay_max"])),
+                "n": len(v["throughput"]),
+            }
+            for key, v in grouped.items()
+        }
+
+    plot_per_k_surfaces(
+        aggregated_per_p,
+        eps_values_e1=eps_sorted,
+        eps_values_e2=eps_sorted,
+        series_label="P",
+        title_suffix=(
+            f"SR-ARQ [{feedback_mode.name}] JamMpMh sweep_eps_grid_per_p "
+            f"(H={num_hops}, k={jammer_k}, alpha={jammer_alpha}, RTT={rtt}, W={window}, "
+            f"iof={in_order_forwarding}, nqs={node_queue_size}); one surface per P"
+        ),
+        plot_path=plot_file,
+        capacity_func=None,
+    )
+
+
+def mode_sweep_eps_grid_per_h(
+    *,
+    eps_values: list[float],
+    h_values: list[int],
+    num_paths: int,
+    rtt: int,
+    num_packets_to_send: int,
+    max_iterations: int,
+    jammer_k: int,
+    jammer_alpha: int,
+    num_iterations: int,
+    in_order_forwarding: bool,
+    node_queue_size: int | None,
+    packets_per_path: int | None,
+    feedback_mode: SRFeedbackMode,
+    results_file: str,
+    plot_file: str,
+    load_existing: bool,
+    parallel_workers: int = 1,
+) -> None:
+    """Sweep the number of hops H over h_values (num_paths, jammer_k, jammer_alpha
+    fixed), one 3D surface per H over the (e1, e2) grid. ε matrix = paper 4x3
+    template tiled cyclically to num_paths x H. The SR window is sized per H:
+    2*(RTT-1) for the E2E feedback modes, else 2*(RTT//H - 1) (per-hop). RTT must
+    satisfy (RTT/2) % H == 0 for every H (caller uses RTT=72 for [3,6,9,12])."""
+    eps_sorted = sorted(eps_values)
+
+    def _window_for(H: int) -> int:
+        return 2 * (rtt - 1) if feedback_mode.is_e2e() else 2 * (rtt // H - 1)
+
+    if load_existing and os.path.exists(results_file):
+        per_h_results = load_pickle(results_file)
+    else:
+        per_h_target_count = num_iterations * len(eps_sorted) ** 2
+        tasks: list[tuple] = []
+        for H in h_values:
+            window_h = _window_for(H)
+            for it in range(1, num_iterations + 1):
+                for e1 in eps_sorted:
+                    for e2 in eps_sorted:
+                        tasks.append((
+                            H, jammer_k, float(e1), float(e2), it, jammer_alpha,
+                            num_paths, H, rtt, num_packets_to_send, max_iterations,
+                            window_h, in_order_forwarding, node_queue_size, packets_per_path,
+                            feedback_mode,
+                        ))
+
+        per_h_results: dict[int, list[tuple[float, float, SimulationStats]]] = {
+            H: [] for H in h_values
+        }
+        per_h_complete: dict[int, int] = {H: 0 for H in h_values}
+        total = len(tasks)
+        completed = 0
+        for _, result in _execute_tasks(tasks, parallel_workers=parallel_workers, progress_label="sweep_eps_grid_per_h"):
+            (group_key, _k, e1, e2, it, _alpha, stats) = result
+            per_h_results[group_key].append((e1, e2, stats))
+            per_h_complete[group_key] += 1
+            completed += 1
+            if completed % 50 == 0 or completed == total or completed <= parallel_workers:
+                print(
+                    f"[{completed}/{total}] H={group_key:>2} iter {it}/{num_iterations} "
+                    f"e1={e1:.1f} e2={e2:.1f} -> "
+                    f"tp={stats.normalized_throughput:.4f} "
+                    f"delay_mean={stats.inorder_delay_mean:.2f}"
+                )
+            if per_h_complete[group_key] == per_h_target_count:
+                save_pickle(per_h_results, results_file, prefix="sr_jam_sweep_eps_grid_per_h")
+                print(f"[checkpoint] H={group_key} complete -> saved partial pickle")
+        save_pickle(per_h_results, results_file, prefix="sr_jam_sweep_eps_grid_per_h")
+
+    aggregated_per_h: dict[int, dict[tuple[float, float], dict]] = {}
+    for H, results in per_h_results.items():
+        grouped: defaultdict = defaultdict(
+            lambda: {"throughput": [], "delay_mean": [], "delay_max": []}
+        )
+        for e1, e2, stats in results:
+            grouped[(float(e1), float(e2))]["throughput"].append(stats.normalized_throughput)
+            grouped[(float(e1), float(e2))]["delay_mean"].append(stats.inorder_delay_mean)
+            grouped[(float(e1), float(e2))]["delay_max"].append(stats.inorder_delay_max)
+        aggregated_per_h[H] = {
+            key: {
+                "throughput_mean": float(np.mean(v["throughput"])),
+                "throughput_std": float(np.std(v["throughput"])),
+                "delay_mean_mean": float(np.mean(v["delay_mean"])),
+                "delay_mean_std": float(np.std(v["delay_mean"])),
+                "delay_max_mean": float(np.mean(v["delay_max"])),
+                "delay_max_std": float(np.std(v["delay_max"])),
+                "n": len(v["throughput"]),
+            }
+            for key, v in grouped.items()
+        }
+
+    plot_per_k_surfaces(
+        aggregated_per_h,
+        eps_values_e1=eps_sorted,
+        eps_values_e2=eps_sorted,
+        series_label="H",
+        title_suffix=(
+            f"SR-ARQ [{feedback_mode.name}] JamMpMh sweep_eps_grid_per_h "
+            f"(P={num_paths}, k={jammer_k}, alpha={jammer_alpha}, RTT={rtt}, "
+            f"iof={in_order_forwarding}, nqs={node_queue_size}); one surface per H"
+        ),
+        plot_path=plot_file,
+        capacity_func=None,
     )
 
 
@@ -743,7 +964,7 @@ def _run_main() -> None:
     EPS_E2 = 0.2
 
     # ---- Mode selection --------------------------------------------------
-    MODE = "sweep_eps_grid_per_alpha"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_eps_grid_per_alpha", "validate_k0"
+    MODE = "sweep_eps_grid_per_h"  # one of: "sweep_k", "sweep_k_multi_eps", "sweep_eps_grid_per_k", "sweep_eps_grid_per_alpha", "sweep_eps_grid_per_p", "sweep_eps_grid_per_h", "validate_k0"
     LOAD_EXISTING = False
 
     # ---- SR feedback mode (exactly one per run) --------------------------
@@ -826,8 +1047,25 @@ def _run_main() -> None:
     # sweep_eps_grid_per_alpha config
     ALPHA_VALUES: list[int] = [RTT, 1, 0.5, 0.1]
     SWEEP_ALPHA_K = 3
-    ALPHA_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_alpha_results_{_CFG_TAG}.pkl"
-    ALPHA_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_alpha_{_CFG_TAG}.png"
+    ALPHA_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_alpha_results_{_CFG_TAG}_k_{SWEEP_ALPHA_K}.pkl"
+    ALPHA_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_alpha_{_CFG_TAG}_k_{SWEEP_ALPHA_K}.png"
+
+    # sweep_eps_grid_per_p / sweep_eps_grid_per_h config: one 3D surface per P (or H)
+    # over the (e1, e2) grid, at fixed jammer k/alpha. ε matrix = paper 4x3 template
+    # tiled cyclically to P x H. Concise filenames (avoid the long _CFG_TAG).
+    SWEEP_PH_K = 3                       # fixed jammer k for both P- and H-sweeps
+    SWEEP_PH_ALPHA = 1                   # fixed jammer alpha for both sweeps
+    # P-sweep: vary channels P, hops fixed at NUM_HOPS (=3), RTT=RTT (=12).
+    P_VALUES: list[int] = [4, 8, 12, 16]
+    P_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_p_results_{_FB_TAG}_rtt_{RTT}_k_{SWEEP_PH_K}.pkl"
+    P_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_p_{_FB_TAG}_rtt_{RTT}_k_{SWEEP_PH_K}.png"
+    # H-sweep: vary hops H, channels fixed at NUM_PATHS (=4). Needs (RTT/2) % H == 0
+    # for every H, so use RTT=72 (RTT/2=36 divisible by 3,6,9,12). Window sized per H
+    # inside the mode (2*(RTT-1) for E2E, else 2*(RTT//H - 1)).
+    H_VALUES: list[int] = [3, 6, 9, 12]
+    H_SWEEP_RTT = 72
+    H_RESULTS_FILE = f"sr_jam_sweep_eps_grid_per_h_results_{_FB_TAG}_rtt_{H_SWEEP_RTT}_k_{SWEEP_PH_K}.pkl"
+    H_PLOT_FILE = f"sr_jam_sweep_eps_grid_per_h_{_FB_TAG}_rtt_{H_SWEEP_RTT}_k_{SWEEP_PH_K}.png"
 
     # validate_k0 config
     VALIDATE_RESULTS_FILE = f"sr_jam_validate_k0_results_{_CFG_TAG}.pkl"
@@ -890,6 +1128,30 @@ def _run_main() -> None:
             node_queue_size=NODE_QUEUE_SIZE, packets_per_path=PACKETS_PER_PATH,
             feedback_mode=SR_FEEDBACK_MODE, results_file=ALPHA_RESULTS_FILE,
             plot_file=ALPHA_PLOT_FILE, load_existing=LOAD_EXISTING,
+            parallel_workers=PARALLEL_WORKERS,
+        )
+    elif MODE == "sweep_eps_grid_per_p":
+        print(f"Running sweep_eps_grid_per_p with eps_values: {EPS_GRID_VALUES} and p_values: {P_VALUES}")
+        mode_sweep_eps_grid_per_p(
+            eps_values=EPS_GRID_VALUES, p_values=P_VALUES, num_hops=NUM_HOPS, rtt=RTT,
+            num_packets_to_send=NUM_PACKETS_TO_SEND, max_iterations=MAX_ITERATIONS,
+            jammer_k=SWEEP_PH_K, jammer_alpha=SWEEP_PH_ALPHA, num_iterations=NUM_ITERATIONS,
+            window=SR_WINDOW, in_order_forwarding=IN_ORDER_FORWARDING,
+            node_queue_size=NODE_QUEUE_SIZE, packets_per_path=PACKETS_PER_PATH,
+            feedback_mode=SR_FEEDBACK_MODE, results_file=P_RESULTS_FILE,
+            plot_file=P_PLOT_FILE, load_existing=LOAD_EXISTING,
+            parallel_workers=PARALLEL_WORKERS,
+        )
+    elif MODE == "sweep_eps_grid_per_h":
+        print(f"Running sweep_eps_grid_per_h with eps_values: {EPS_GRID_VALUES} and h_values: {H_VALUES}")
+        mode_sweep_eps_grid_per_h(
+            eps_values=EPS_GRID_VALUES, h_values=H_VALUES, num_paths=NUM_PATHS,
+            rtt=H_SWEEP_RTT, num_packets_to_send=NUM_PACKETS_TO_SEND,
+            max_iterations=MAX_ITERATIONS, jammer_k=SWEEP_PH_K, jammer_alpha=SWEEP_PH_ALPHA,
+            num_iterations=NUM_ITERATIONS, in_order_forwarding=IN_ORDER_FORWARDING,
+            node_queue_size=NODE_QUEUE_SIZE, packets_per_path=PACKETS_PER_PATH,
+            feedback_mode=SR_FEEDBACK_MODE, results_file=H_RESULTS_FILE,
+            plot_file=H_PLOT_FILE, load_existing=LOAD_EXISTING,
             parallel_workers=PARALLEL_WORKERS,
         )
     elif MODE == "validate_k0":

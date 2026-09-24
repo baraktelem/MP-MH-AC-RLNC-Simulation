@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 from mp_simulation import plot_stats, aggregate_results
@@ -79,19 +80,22 @@ def is_per_k_results(obj) -> bool:
 
 def series_kind_for_file(filepath) -> tuple[str, callable]:
     """Infer the series dimension of a numeric-keyed surface pickle from its
-    filename. sweep_eps_grid_per_alpha files -> ('α', fmt); everything else
-    (sweep_eps_grid_per_k) -> ('k', str). For alpha files the RTT is parsed from
-    the filename when present so the legend can show the jamming-round length
+    filename: sweep_eps_grid_per_alpha -> 'α', per_p -> 'P', per_h -> 'H',
+    everything else (per_k) -> 'k'. For alpha files the RTT is parsed from the
+    filename when present so the legend can show the jamming-round length
     (jamming_round_time = RTT / alpha), matching the live sim plot."""
     stem = os.path.splitext(os.path.basename(str(filepath)))[0].lower()
-    is_alpha = ("per_alpha" in stem) or ("sweep_alpha" in stem)
-    if not is_alpha:
-        return "k", (lambda v: f"{v}")
-    m = re.search(r"rtt[_]?(\d+)", stem)
-    rtt = int(m.group(1)) if m else None
-    if rtt:
-        return "α", (lambda a: f"{a:g} (round≈{rtt / a:g})")
-    return "α", (lambda a: f"{a:g}")
+    if ("per_alpha" in stem) or ("sweep_alpha" in stem):
+        m = re.search(r"rtt[_]?(\d+)", stem)
+        rtt = int(m.group(1)) if m else None
+        if rtt:
+            return "α", (lambda a: f"{a:g} (round≈{rtt / a:g})")
+        return "α", (lambda a: f"{a:g}")
+    if "per_p" in stem:
+        return "P", (lambda v: f"{v}")
+    if "per_h" in stem:
+        return "H", (lambda v: f"{v}")
+    return "k", (lambda v: f"{v}")
 
 
 def is_multi_series_results(obj) -> bool:
@@ -341,6 +345,323 @@ def build_overlay_series_and_capacities(
 
     return series, capacity_surfaces
 
+
+# ---------------------------------------------------------------------------
+# Paper-format comparison (stacked rows: one pkl per row, 3 metric columns)
+# ---------------------------------------------------------------------------
+
+# (mean_key, std_key, side_label). The side_label becomes the z-axis (side)
+# label of each subplot -- there is no title above in paper mode.
+_PAPER_METRICS = [
+    ("throughput_mean", "throughput_std", "Normalized Throughput"),
+    ("delay_mean_mean", "delay_mean_std", "Mean In-Order Delay [slots]"),
+    ("delay_max_mean", "delay_max_std", "Max In-Order Delay [slots]"),
+]
+
+
+def _parse_cli_args(argv: list[str]) -> tuple[list[str], bool, str, list[str]]:
+    """Split raw argv into (files, paper_mode, out_stem, row_labels).
+
+    Recognizes the ``-paper``/``--paper`` flag, an optional output override
+    (``-o``/``--out PATH`` or ``--out=PATH``), and optional per-row protocol
+    headers (``--row-labels "MH MP AC-RLNC;SR ARQ"`` or ``--row-labels=...``;
+    semicolon-separated, one per pkl in file order). Every other token is treated
+    as a results file. ``out_stem`` is the output path without extension (paper
+    mode writes both ``<stem>.png`` and ``<stem>.pdf``); defaults to
+    'paper_comparison'. ``row_labels`` is empty when the flag is not given
+    (headers are then auto-detected from filenames)."""
+    paper_mode = False
+    out_stem = "paper_comparison"
+    files: list[str] = []
+    row_labels: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        low = arg.lower()
+        if low in ("-paper", "--paper"):
+            paper_mode = True
+        elif low in ("-o", "--out"):
+            if i + 1 < len(argv):
+                out_stem = os.path.splitext(argv[i + 1])[0]
+                i += 1
+            else:
+                print("[WARNING] --out given without a path; using default output name.")
+        elif low.startswith("--out="):
+            out_stem = os.path.splitext(arg.split("=", 1)[1])[0]
+        elif low in ("--row-labels", "-row-labels"):
+            if i + 1 < len(argv):
+                row_labels = [s.strip() for s in argv[i + 1].split(";")]
+                i += 1
+            else:
+                print("[WARNING] --row-labels given without a value; ignoring.")
+        elif low.startswith("--row-labels="):
+            row_labels = [s.strip() for s in arg.split("=", 1)[1].split(";")]
+        else:
+            files.append(arg)
+        i += 1
+    return files, paper_mode, out_stem, row_labels
+
+
+def _auto_protocol_label(stem: str) -> str:
+    """Best-effort protocol name for a per-row header when --row-labels is not
+    supplied. SR-ARQ result pickles are saved with an 'sr' filename prefix; all
+    other jam sweeps come from the MH MP AC-RLNC simulator."""
+    return "SR ARQ" if stem.lower().startswith("sr") else "MH MP AC-RLNC"
+
+
+def build_paper_rows(
+    valid_files: list[str],
+) -> list[tuple[str, list[tuple[str, dict[tuple[float, float], dict]]]]]:
+    """Load each pickle and turn it into one figure 'row'.
+
+    Returns a list of ``(pkl_stem, surfaces)`` where ``surfaces`` is a list of
+    ``(surface_label, aggregated_dict)``. Supports the three saved formats:
+      - per-k / per-alpha dict -> one surface per non-empty series value
+        (label like ``k=3`` / ``α=...``)
+      - multi-series dict       -> one surface per string key (friendly label)
+      - flat list               -> a single surface labelled with the stem
+    Empty series / files are skipped with a warning."""
+    rows: list[tuple[str, list[tuple[str, dict]]]] = []
+    for filepath in valid_files:
+        stem = os.path.splitext(os.path.basename(str(filepath)))[0]
+        results = load_results_any(filepath)
+        surfaces: list[tuple[str, dict]] = []
+        if is_per_k_results(results):
+            s_label, s_fmt = series_kind_for_file(filepath)
+            for k in sorted(results.keys()):
+                if not results[k]:
+                    continue
+                agg = _snap_agg_keys(aggregate_results(results[k]))
+                surfaces.append((f"{s_label}={s_fmt(k)}", agg))
+        elif is_multi_series_results(results):
+            for key, series_results in results.items():
+                if not series_results:
+                    continue
+                agg = _snap_agg_keys(aggregate_results(series_results))
+                surfaces.append((series_label(key, stem), agg))
+        elif isinstance(results, list):
+            surfaces.append((stem, _snap_agg_keys(aggregate_results(results))))
+        else:
+            print(
+                f"[ERROR] Unsupported results format in {filepath}: "
+                f"{type(results).__name__} - skipping row"
+            )
+            continue
+        if surfaces:
+            rows.append((stem, surfaces))
+        else:
+            print(f"[WARNING] No plottable data in {filepath} - skipping row")
+    return rows
+
+
+def _paper_palette(n: int) -> list:
+    """Return ``n`` visually-distinct RGBA colors. Uses a curated qualitative
+    list first (tab10 + tab20b, de-duplicated) and, if more are needed, extends
+    with evenly-spaced HSV samples so that no two surfaces anywhere in the
+    figure share a color (requirement #6)."""
+    from matplotlib.colors import to_rgba
+    import colorsys
+
+    curated = list(plt.get_cmap("tab10").colors) + list(plt.get_cmap("tab20b").colors)
+    seen: set = set()
+    palette: list = []
+    for c in curated:
+        rgba = to_rgba(c)
+        if rgba not in seen:
+            seen.add(rgba)
+            palette.append(rgba)
+    if n > len(palette):
+        extra = n - len(palette)
+        for i in range(extra):
+            h = i / max(1, extra)
+            palette.append(to_rgba(colorsys.hsv_to_rgb(h, 0.65, 0.85)))
+    return palette[:n]
+
+
+def assign_paper_colors(
+    rows: list[tuple[str, list[tuple[str, dict]]]],
+) -> list[list]:
+    """Assign a globally-unique color to every surface across all rows.
+
+    Returns ``colors_by_row`` so that ``colors_by_row[r][s]`` is the RGBA for
+    surface ``s`` of row ``r``. The same color is reused for that surface in all
+    three metric columns, and no color repeats anywhere in the figure."""
+    total = sum(len(surfaces) for _stem, surfaces in rows)
+    palette = _paper_palette(total)
+    colors_by_row: list[list] = []
+    idx = 0
+    for _stem, surfaces in rows:
+        row_colors = []
+        for _ in surfaces:
+            row_colors.append(palette[idx])
+            idx += 1
+        colors_by_row.append(row_colors)
+    return colors_by_row
+
+
+def _paper_zmax(
+    rows: list[tuple[str, list[tuple[str, dict]]]],
+    eps_e1: list[float],
+    eps_e2: list[float],
+    *,
+    include_std: bool,
+) -> dict[str, float]:
+    """Per-metric global z-max across every surface of every row (requirement
+    #5). When ``include_std`` is True the whisker tops (``mean + std``) are
+    included so error bars are never clipped. Keyed by the metric's mean key."""
+    zmax: dict[str, float] = {}
+    for mean_key, std_key, _label in _PAPER_METRICS:
+        gmax = 0.0
+        for _stem, surfaces in rows:
+            for _slabel, agg in surfaces:
+                for e1 in eps_e1:
+                    for e2 in eps_e2:
+                        cell = agg.get((e1, e2), {})
+                        m = float(cell.get(mean_key, 0.0))
+                        s = float(cell.get(std_key, 0.0)) if include_std else 0.0
+                        gmax = max(gmax, m + s)
+        zmax[mean_key] = max(0.1, gmax * 1.05)
+    return zmax
+
+
+def plot_paper_grid(
+    rows: list[tuple[str, list[tuple[str, dict]]]],
+    *,
+    eps_values_e1: list[float],
+    eps_values_e2: list[float],
+    out_stem: str,
+    draw_std: bool = True,
+    row_labels: list[str] | None = None,
+) -> None:
+    """Render the paper-format comparison figure.
+
+    Layout: one pkl per row, three metric columns (throughput / mean delay /
+    max delay). Header-free (no per-subplot titles, no suptitle, requirement
+    #2/#4 -- the metric name lives on the z-axis / side), no capacity surface
+    (requirement #3), opaque mesh surfaces, optional std whiskers, one legend
+    per row on the throughput (col-0) subplot (requirement #6), and a shared
+    per-metric z-scale across all rows (requirement #5). Saves both PNG and a
+    vector PDF."""
+    n_rows = len(rows)
+    n_e1 = len(eps_values_e1)
+    n_e2 = len(eps_values_e2)
+    EPS1, EPS2 = np.meshgrid(eps_values_e1, eps_values_e2)
+
+    colors_by_row = assign_paper_colors(rows)
+    zmax_by_metric = _paper_zmax(
+        rows, eps_values_e1, eps_values_e2, include_std=draw_std
+    )
+
+    fig = plt.figure(figsize=(20, 6 * n_rows))
+    axes_grid: list[list] = []
+    for r, (_stem, surfaces) in enumerate(rows):
+        row_colors = colors_by_row[r]
+        row_axes = []
+        for c, (mean_key, std_key, side_label) in enumerate(_PAPER_METRICS):
+            ax = fig.add_subplot(n_rows, 3, r * 3 + c + 1, projection="3d")
+            row_axes.append(ax)
+            legend_patches = []
+            for s_idx, (surf_label, agg) in enumerate(surfaces):
+                color = row_colors[s_idx]
+
+                mean_grid = np.zeros((n_e1, n_e2))
+                for i, e1 in enumerate(eps_values_e1):
+                    for j, e2 in enumerate(eps_values_e2):
+                        mean_grid[i, j] = agg.get((e1, e2), {}).get(mean_key, 0.0)
+
+                # Opaque surface with a light mesh so overlapping surfaces still
+                # read as solid, paper-style panels.
+                ax.plot_surface(
+                    EPS1,
+                    EPS2,
+                    mean_grid.T,
+                    color=color,
+                    edgecolor="k",
+                    linewidth=0.2,
+                    alpha=1.0,
+                )
+
+                if draw_std:
+                    for i, e1 in enumerate(eps_values_e1):
+                        for j, e2 in enumerate(eps_values_e2):
+                            s = agg.get((e1, e2), {}).get(std_key, 0.0)
+                            if s <= 0:
+                                continue
+                            m = mean_grid[i, j]
+                            ax.plot(
+                                [e1, e1],
+                                [e2, e2],
+                                [m - s, m + s],
+                                color="black",
+                                linewidth=0.7,
+                                alpha=0.5,
+                            )
+
+                legend_patches.append(Patch(color=color, label=surf_label))
+
+            ax.set_xlabel("ε₁")
+            ax.set_ylabel("ε₂")
+            ax.set_zlabel(side_label)
+            ax.set_zlim(0, zmax_by_metric[mean_key])
+            # Match the per-k / SR orientation: shallow pitch, both eps axes
+            # inverted so the low-eps corner faces the viewer.
+            ax.view_init(elev=10, azim=-45)
+            ax.invert_xaxis()
+            ax.invert_yaxis()
+            # One legend per pkl-row, nestled inside the upper-left of the
+            # throughput (col-0) plot like paper Fig. 19 (framed box sitting on
+            # the plot rather than floating above it). bbox_to_anchor pulls it
+            # down into the 3D cube's empty upper-left corner.
+            if c == 0:
+                leg = ax.legend(
+                    handles=legend_patches,
+                    fontsize=9,
+                    loc="upper left",
+                    bbox_to_anchor=(0.04, 0.72),
+                    framealpha=1.0,
+                    edgecolor="0.3",
+                    fancybox=False,
+                    borderpad=0.6,
+                )
+                # In 3D, plot_surface collections receive dynamic (depth-based)
+                # zorders on every draw and can paint over the legend, leaving it
+                # hidden behind the surfaces. Forcing a very high zorder keeps the
+                # (opaque) legend box drawn on top of all surfaces.
+                leg.set_zorder(10000)
+
+        axes_grid.append(row_axes)
+
+    plt.tight_layout()
+
+    # Per-row protocol headers: a bold title centered above each row's three
+    # panels (placed after tight_layout so axes positions are final).
+    if row_labels:
+        for r, row_axes in enumerate(axes_grid):
+            if r >= len(row_labels) or not row_labels[r]:
+                continue
+            positions = [a.get_position() for a in row_axes]
+            x_center = (
+                min(p.x0 for p in positions) + max(p.x1 for p in positions)
+            ) / 2.0
+            y_top = max(p.y1 for p in positions)
+            fig.text(
+                x_center,
+                min(0.995, y_top + 0.005),
+                row_labels[r],
+                ha="center",
+                va="bottom",
+                fontsize=16,
+                fontweight="bold",
+            )
+    png_path = f"{out_stem}.png"
+    pdf_path = f"{out_stem}.pdf"
+    plt.savefig(png_path, dpi=200, bbox_inches="tight")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"[OK] Paper plot saved to: {png_path}")
+    print(f"[OK] Paper plot saved to: {pdf_path}")
+    plt.show()
+
+
 def plot_stats_comparison(datasets: list[tuple[str, list]]):
     """
     Plot comparison of multiple protocols on the same 3D graphs.
@@ -523,15 +844,19 @@ if __name__ == "__main__":
     print(" "*20 + "Plot Saved Results")
     print("="*70)
     
-    # Get filenames from command line or use default
-    if len(sys.argv) > 1:
-        results_files = sys.argv[1:]
+    # Parse CLI: -paper/--paper flag, optional -o/--out PATH, and the file list.
+    file_args, paper_mode, out_stem, row_labels_arg = _parse_cli_args(sys.argv[1:])
+    if file_args:
+        results_files = file_args
     else:
         current_dir = Path('.')
         mp_sim_results = current_dir / 'simulation_results.pkl'
         sr_sim_results = current_dir / 'sr_arq' / 'results_sr' / 'sr_simulation_results.pkl'
         results_files = [mp_sim_results, sr_sim_results]
         # results_files = [sr_sim_results]
+    if paper_mode:
+        print("[paper] Paper-format mode enabled "
+              "(stacked rows, shared per-metric scale, PNG + PDF).")
     
     # Check if files exist
     valid_files = []
@@ -544,7 +869,41 @@ if __name__ == "__main__":
     if not valid_files:
         print("[ERROR] No valid result files found!")
         sys.exit(1)
-    
+
+    # Paper-format mode: one pkl per row, 3 metric columns, shared per-metric
+    # z-scale, globally-unique surface colors, one legend per row, no headers /
+    # capacity. Handled here before the standard routing below.
+    if paper_mode:
+        print(f"\nBuilding paper-format figure from {len(valid_files)} file(s)...")
+        print("="*70)
+        rows = build_paper_rows(valid_files)
+        if not rows:
+            print("[ERROR] No plottable data found for paper mode.")
+            sys.exit(1)
+        eps1, eps2 = _eps_grid_from_aggs(
+            [agg for _stem, surfaces in rows for _lbl, agg in surfaces]
+        )
+        # Resolve one protocol header per row: use --row-labels when given
+        # (in file order), otherwise auto-detect from the filename.
+        row_headers = [
+            row_labels_arg[idx]
+            if idx < len(row_labels_arg) and row_labels_arg[idx]
+            else _auto_protocol_label(stem)
+            for idx, (stem, _surfaces) in enumerate(rows)
+        ]
+        plot_paper_grid(
+            rows,
+            eps_values_e1=eps1,
+            eps_values_e2=eps2,
+            out_stem=out_stem,
+            draw_std=True,
+            row_labels=row_headers,
+        )
+        print(f"\n{'='*70}")
+        print("Plots saved successfully!")
+        print("="*70)
+        sys.exit(0)
+
     # Load results from all files; auto-route per-k / multi-series / flat-list
     flat_datasets: list[tuple[str, list]] = []
     per_k_datasets: list[tuple[str, dict, str]] = []
