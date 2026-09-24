@@ -1007,7 +1007,12 @@ def _run_main() -> None:
 
     # Parallelization for the sweep modes. 1 = serial. os.cpu_count() // 2 leaves
     # headroom for the OS. Applies to every mode here.
-    PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+    # Under SLURM, honor SIM_PARALLEL_WORKERS (the sbatch script sets it to
+    # SLURM_CPUS_PER_TASK) so the pool matches the job's allocation instead of the
+    # whole node's core count (os.cpu_count() over-reports inside a cgroup).
+    PARALLEL_WORKERS = int(
+        os.environ.get("SIM_PARALLEL_WORKERS", max(1, (os.cpu_count() or 2) // 2))
+    )
 
     # Config tag keeps HBH/E2E, different-knob, and different-stop-trigger runs from
     # colliding on disk (mirrors the filename tagging in sr_arq_mpmh_simulation.py).

@@ -1429,7 +1429,12 @@ def _run_main() -> None:
     # sweep_eps_grid_per_k, sweep_eps_grid_per_alpha). 1 = serial. A safe default is
     # os.cpu_count() // 2 to leave headroom for the OS / other apps. Set to
     # os.cpu_count() to use every core. Has no effect on validate_k0.
-    PARALLEL_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+    # Under SLURM, honor SIM_PARALLEL_WORKERS (the sbatch script sets it to
+    # SLURM_CPUS_PER_TASK) so the pool matches the job's allocation instead of the
+    # whole node's core count (os.cpu_count() over-reports inside a cgroup).
+    PARALLEL_WORKERS = int(
+        os.environ.get("SIM_PARALLEL_WORKERS", max(1, (os.cpu_count() or 2) // 2))
+    )
 
     # sweep_k config
     K_VALUES: list[int] = list(range(0, NUM_PATHS * NUM_HOPS + 1))
