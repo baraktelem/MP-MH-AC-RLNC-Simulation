@@ -24,10 +24,10 @@ class SRReceiver(GeneralReceiver):
     pipeline reads), so throughput / in-order delay are computed unchanged.
     """
 
-    def __init__(self, input_paths: list[Path], rtt: int, unit_name: str = None, debug: bool = False):
+    def __init__(self, input_paths: list[Path], rtt: int, unit_name: str = None, debug: bool = False, store_history: bool = True):
         if unit_name is None:
             unit_name = "SRReceiver"
-        super().__init__(input_paths, rtt, unit_name, debug=debug)
+        super().__init__(input_paths, rtt, unit_name, debug=debug, store_history=store_history)
 
         # In-order delivery state (seqs are 1..N).
         self.delivered_up_to: int = 0          # highest in-order delivered seq
@@ -89,10 +89,11 @@ class SRSimReceiver(GeneralReceiver):
         e2e_feedback_channels: dict[int, Channel] = None,
         e2e_prop_delay: int = None,
         debug: bool = False,
+        store_history: bool = True,
     ):
         if unit_name is None:
             unit_name = "SRSimReceiver"
-        super().__init__(input_paths, rtt, unit_name, debug=debug)
+        super().__init__(input_paths, rtt, unit_name, debug=debug, store_history=store_history)
         self.stride = num_chains  # global round-robin stride (= P)
 
         # End-to-end feedback wiring. In both E2E modes the receiver emits a

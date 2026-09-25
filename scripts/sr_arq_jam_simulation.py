@@ -96,6 +96,16 @@ from jam_mp_mh_simulation import (
 )
 
 
+# Low-memory mode: drop the unbounded per-packet history logs inside the SR-ARQ
+# stack (channel / dropped / jammed / received / source-feedback histories) so a
+# long, heavily jammed run (e.g. k=9 with a full 500-packet target) stays within
+# the SLURM memory budget. Defined at module scope so ProcessPoolExecutor workers
+# (which re-import this module) pick it up via the runner defaults below. Set to
+# False to restore full per-packet history logging (needed if a caller inspects
+# those histories, e.g. some unit tests).
+LOW_MEMORY = True
+
+
 # ---------------------------------------------------------------------------
 # Single-sim runners
 # ---------------------------------------------------------------------------
@@ -116,6 +126,7 @@ def run_sr_jam_network(
     packets_per_path: int | None,
     feedback_mode: SRFeedbackMode,
     debug: bool = False,
+    low_memory: bool = LOW_MEMORY,
 ) -> SimulationStats:
     """Run one SRJamMpMhNetwork simulation. The network's run_sim handles the stop
     trigger (max_iterations / num_packets_to_send / packets_per_path) and publishes
@@ -136,6 +147,7 @@ def run_sr_jam_network(
         jammer_alpha=jammer_alpha,
         jammer_k=jammer_k,
         debug=debug,
+        low_memory=low_memory,
     )
     net.run_sim()
     return net.get_simulation_stats()
@@ -155,6 +167,7 @@ def run_sr_plain_network(
     packets_per_path: int | None,
     feedback_mode: SRFeedbackMode,
     debug: bool = False,
+    low_memory: bool = LOW_MEMORY,
 ) -> SimulationStats:
     """Run one plain (un-jammed) SRMpMhNetwork on the same epsilon matrix for the
     validate_k0 comparison. Uses SRMpMhNetwork.run_sim, which honors the same three
@@ -172,6 +185,7 @@ def run_sr_plain_network(
         packets_per_path=packets_per_path,
         feedback_mode=feedback_mode,
         debug=debug,
+        low_memory=low_memory,
     )
     net.run_sim()
     return net.get_simulation_stats()
@@ -1085,6 +1099,7 @@ def _run_main() -> None:
     print(f"  - Outer iterations: {NUM_ITERATIONS}")
     print(f"  - eps template: e1={EPS_E1}, e2={EPS_E2}")
     print(f"  - workers: {PARALLEL_WORKERS}")
+    print(f"  - low_memory: {LOW_MEMORY}")
     print(f"  - MODE: {MODE}\n")
 
     if MODE == "sweep_k":

@@ -141,6 +141,7 @@ class SRMpMhNetwork(MhNetwork):
         packets_per_path: int = None,
         feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
+        low_memory: bool = False,
     ):
         # Equal per-path quota implies a global delivery target of P * N.
         if packets_per_path is not None:
@@ -164,6 +165,11 @@ class SRMpMhNetwork(MhNetwork):
             debug,
         )
         self.packets_per_path = packets_per_path
+        # Low-memory mode (set by the SR jam driver): skip the unbounded per-packet
+        # history logs. store_history is the channel/receiver-facing form; low_memory
+        # is the sender/node-facing form. Default off preserves current behavior.
+        self.low_memory = low_memory
+        self.store_history = not low_memory
         # Feedback / relay mode (HBH default; two E2E variants). In both E2E modes
         # the source's feedback comes end-to-end from the receiver over dedicated
         # per-chain channels; the relay behaviour differs (see SRFeedbackMode).
@@ -211,6 +217,7 @@ class SRMpMhNetwork(MhNetwork):
                     path_index_in_hop=c,
                     name_prefix=f"E2E[{gid}].",
                     debug=self.debug,
+                    store_history=self.store_history,
                 )
                 channel.set_global_path_index(gid)
                 self.e2e_feedback_channels[gid] = channel
@@ -225,6 +232,7 @@ class SRMpMhNetwork(MhNetwork):
             e2e_feedback_channels=self.e2e_feedback_channels,
             e2e_prop_delay=self.global_prop_delay,
             debug=self.debug,
+            store_history=self.store_history,
         )
 
         # One SRNode per (chain, hop), single-in/single-out; network ticks them.
@@ -243,6 +251,7 @@ class SRMpMhNetwork(MhNetwork):
                     node_queue_size=node_queue_size,
                     feedback_mode=self.feedback_mode,
                     debug=self.debug,
+                    low_memory=self.low_memory,
                 )
 
         # Source on the hop-0 paths (per-chain independent streams).
@@ -259,13 +268,14 @@ class SRMpMhNetwork(MhNetwork):
             e2e_feedback_channels=self.e2e_feedback_channels,
             e2e_rtt=self.global_rtt,
             debug=self.debug,
+            low_memory=self.low_memory,
         )
 
     def _make_path(self, prop_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int) -> Path:
         """Factory for one forward path. Overridden by SRJamMpMhNetwork to build a
         JamPath (a Path whose forward channel a Jammer can block) instead of a
         plain Path, so the jammed topology reuses this __init__ verbatim."""
-        return Path(prop_delay, epsilon, hop_index, path_index_in_hop, debug=self.debug)
+        return Path(prop_delay, epsilon, hop_index, path_index_in_hop, debug=self.debug, store_history=self.store_history)
 
     def _tick(self):
         # Explicit order: source -> nodes (hop-major) -> receiver.
@@ -330,3 +340,17 @@ class SRMpMhNetwork(MhNetwork):
             if tc > 0:
                 tp += cnt / tc
         self.normalized_throughput = tp
+
+    def collect_stats(self):
+        # Build the base SimulationStats, then set the three fields the base derives
+        # from the sender's history lists (which are empty in low-memory mode) from
+        # the always-on counters instead. When low_memory is off the counters equal
+        # the list lengths, so this is identical to the base result. SR has no
+        # FEC/FB-FEC, so num_transmissions == num_new_transmissions.
+        super().collect_stats()
+        stats = self.simulation_stats
+        stats.num_new_rlnc_packets = self.sender.num_new_transmissions
+        stats.num_transmissions = self.sender.num_new_transmissions
+        stats.num_transmissions_dropped = sum(
+            p.forward_channel.num_dropped for p in self.sender.paths
+        )

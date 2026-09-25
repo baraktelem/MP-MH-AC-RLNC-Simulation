@@ -12,13 +12,13 @@ class Path:
     feedback_channel: 'Channel' # The channel object that is responsible for sending ACK/NACKs back to the sender
     propagation_delay: int
 
-    def __init__(self, propagation_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False):
+    def __init__(self, propagation_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False, store_history: bool = True):
         self.hop_index = hop_index
         self.path_index_in_hop = path_index_in_hop
         self.debug = debug
         self.unit_name = f"{name_prefix}Path[{hop_index}][{path_index_in_hop}]"
-        self.forward_channel = ForwardChannel(propagation_delay, epsilon, hop_index, path_index_in_hop, name_prefix=self.unit_name+".", debug=debug)
-        self.feedback_channel = Channel(propagation_delay, hop_index, path_index_in_hop, name_prefix=self.unit_name+".Feedback", debug=debug)
+        self.forward_channel = ForwardChannel(propagation_delay, epsilon, hop_index, path_index_in_hop, name_prefix=self.unit_name+".", debug=debug, store_history=store_history)
+        self.feedback_channel = Channel(propagation_delay, hop_index, path_index_in_hop, name_prefix=self.unit_name+".Feedback", debug=debug, store_history=store_history)
         self.my_sender = None
         self.my_receiver = None
         assert self.feedback_channel.get_propagation_delay() == self.forward_channel.get_propagation_delay(), \
@@ -93,9 +93,13 @@ class Channel:
     global_path_index: int
     channel_name: str
     
-    def __init__(self, propagation_delay: int, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False):
+    def __init__(self, propagation_delay: int, hop_index: int, path_index_in_hop: int, name_prefix: str="", debug: bool = False, store_history: bool = True):
         self.propagation_delay = propagation_delay
         self.debug = debug
+        # store_history=False (low-memory mode) skips the per-packet channel_history
+        # log, which otherwise grows without bound over a long run. Defaults to True
+        # so existing callers (AC-RLNC, tests) keep the full history unchanged.
+        self.store_history = store_history
         self.packets_in_channel = []
         self.arrived_packets = []
         self.hop_index = hop_index
@@ -128,7 +132,8 @@ class Channel:
             print(f"[{self.channel_name}]: All packets still in channel:\n\t{self.packets_in_channel}")
     
     def add_packet_to_history(self, packet):
-        self.channel_history.append(copy(packet))
+        if self.store_history:
+            self.channel_history.append(copy(packet))
 
     def get_channel_history(self) -> list[Packet]:
         return self.channel_history
@@ -187,6 +192,7 @@ class ForwardChannel(Channel):
         super().__init__(propagation_delay, hop_index, path_index_in_hop, **kwargs)
         self.epsilon = epsilon
         self.dropped_packets = []
+        self.num_dropped = 0
         self.pending_packets_buffer = []
         self.channel_name = "Forward" + self.channel_name
 
@@ -202,7 +208,9 @@ class ForwardChannel(Channel):
     def apply_noise_on_single_packet(self, packet: RLNCPacket) -> tuple[RLNCPacket, bool]:
         dropped = False
         if random.random() < self.epsilon:
-                self.dropped_packets.append(packet)
+                self.num_dropped += 1
+                if self.store_history:
+                    self.dropped_packets.append(packet)
                 dropped = True
         return packet, dropped
 

@@ -62,9 +62,14 @@ class GeneralReceiver:
                 input_paths: list[Path],
                 hop_rtt: int,
                 unit_name: str=None,
-                debug: bool = False):
+                debug: bool = False,
+                store_history: bool = True):
         self.unit_name = unit_name if unit_name is not None else "GeneralReceiver"
         self.debug = debug
+        # store_history=False (low-memory mode) skips the received-RLNC and
+        # sent-feedback per-packet logs (write-only in production). Default True
+        # keeps existing behavior for AC-RLNC and the tests.
+        self.store_history = store_history
 
         # Receiver paths
         self.receiver_paths = [ReceiverPath(path, i, self) for i, path in enumerate(input_paths)]
@@ -103,7 +108,8 @@ class GeneralReceiver:
             else:
                 self.arrived_packet = arrived_packets.pop(0) # Arrived packet is a list with len=1, so we pop the first element
                 # Add packet to history
-                self.received_rlnc_channel_history.append(self.arrived_packet)
+                if self.store_history:
+                    self.received_rlnc_channel_history.append(self.arrived_packet)
                 # Update starting time according to arrived packets
                 receiver_path.update_receiving_packets_strating_time(self.arrived_packet, self.t)
                 # Send ack
@@ -157,7 +163,8 @@ class GeneralReceiver:
         return self.received_rlnc_channel_history
 
     def add_sent_feedback_packet_to_history(self, feedback_packet: FeedbackPacket):
-        self.sent_feedback_channel_history.append(feedback_packet)
+        if self.store_history:
+            self.sent_feedback_channel_history.append(feedback_packet)
 
     def get_sent_feedback_channel_history(self) -> list[FeedbackPacket]:
         return self.sent_feedback_channel_history

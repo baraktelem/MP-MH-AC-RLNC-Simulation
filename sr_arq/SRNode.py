@@ -55,10 +55,11 @@ class SRNodeReceiver(GeneralReceiver):
         unit_name: str = None,
         feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
+        store_history: bool = True,
     ):
         if unit_name is None:
             unit_name = "SRNodeReceiver"
-        super().__init__(input_paths, rtt, unit_name, debug=debug)
+        super().__init__(input_paths, rtt, unit_name, debug=debug, store_history=store_history)
         # E2E_FORWARD_ONLY turns the relay into a best-effort forwarder: this
         # receiver just captures the arrival with no upstream ACK/NACK. HBH and
         # E2E_FULL_ARQ both run the full per-hop SR-ARQ below.
@@ -99,7 +100,8 @@ class SRNodeReceiver(GeneralReceiver):
                 )
                 if arrived_packets:
                     self.arrived_packet = arrived_packets[0]
-                    self.received_rlnc_channel_history.append(self.arrived_packet)
+                    if self.store_history:
+                        self.received_rlnc_channel_history.append(self.arrived_packet)
                     receiver_path.update_receiving_packets_strating_time(self.arrived_packet, self.t)
             return
         # With an unbounded buffer, behave exactly like the base receiver.
@@ -138,7 +140,8 @@ class SRNodeReceiver(GeneralReceiver):
                 self.send_nack(receiver_path)  # backpressure: looks like a loss upstream
                 continue
             self.arrived_packet = pkt
-            self.received_rlnc_channel_history.append(pkt)
+            if self.store_history:
+                self.received_rlnc_channel_history.append(pkt)
             receiver_path.update_receiving_packets_strating_time(pkt, self.t)
             self.send_ack(receiver_path, pkt)
             self._after_rlnc_arrived(receiver_path, pkt)
@@ -183,6 +186,7 @@ class SRNodeSender(SRSender):
         unit_name: str = None,
         window: int = None,
         debug: bool = False,
+        low_memory: bool = False,
     ):
         # num_of_packets_to_send is unused (we override _next_seq_to_send); the
         # node forwards whatever it receives.
@@ -193,6 +197,7 @@ class SRNodeSender(SRSender):
             window=window,
             next_hop=None,
             debug=debug,
+            low_memory=low_memory,
         )
         self.unit_name = unit_name if unit_name is not None else "SRNodeSender"
         self.node_receiver = node_receiver
@@ -258,6 +263,7 @@ class SRNode:
         node_queue_size: int = None,
         feedback_mode: SRFeedbackMode = SRFeedbackMode.HBH,
         debug: bool = False,
+        low_memory: bool = False,
     ):
         self.hop_num = hop_num
         self.unit_name = unit_name if unit_name is not None else f"SRNode[{hop_num}]"
@@ -275,6 +281,7 @@ class SRNode:
             unit_name=f"{self.unit_name}.Receiver",
             feedback_mode=feedback_mode,
             debug=debug,
+            store_history=not low_memory,
         )
         # The sender stays a full SR-ARQ output link (HBH default). In
         # E2E_FORWARD_ONLY it is used only as a plain transmitter (run_step is not
@@ -287,6 +294,7 @@ class SRNode:
             unit_name=f"{self.unit_name}.Sender",
             window=window,
             debug=debug,
+            low_memory=low_memory,
         )
         # Let the receiver measure its held backlog (received but not yet ACKed by
         # the next hop) for flow control -- a slot frees only on the next-hop ACK.

@@ -27,6 +27,21 @@ class SRSenderPath(GeneralSenderPath):
 
     def record_sent_seq(self, creation_time: int, seq: int):
         self.creation_time_to_seq[creation_time] = seq
+        # Low-memory mode: creation_time_to_seq is only read to resolve a slot-based
+        # NACK back to a seq, and a NACK for slot s can only arrive ~1 RTT after s
+        # (lossless, deterministic-delay feedback). Drop entries older than the
+        # sender's prune window (>= 2 RTT) so this dict stays O(window) instead of
+        # growing with the whole run. Keys are inserted in increasing creation_time
+        # order, so we can pop from the front.
+        if self.my_sender.low_memory:
+            cutoff = creation_time - self.my_sender._prune_window
+            d = self.creation_time_to_seq
+            while d:
+                oldest = next(iter(d))
+                if oldest <= cutoff:
+                    del d[oldest]
+                else:
+                    break
 
     def resolve_seq(self, creation_time: int) -> int | None:
         return self.creation_time_to_seq.get(creation_time)
@@ -60,11 +75,19 @@ class SRSender(GeneralSender):
         e2e_feedback_channels: dict[int, Channel] = None,
         e2e_rtt: int = None,
         debug: bool = False,
+        low_memory: bool = False,
     ):
         super().__init__(rtt, paths, init_paths=False, initial_epsilon=initial_epsilon, debug=debug)
         self.unit_name = "SRSender"
         self.num_of_packets_to_send = num_of_packets_to_send
         self.next_hop = next_hop
+        # Low-memory mode: skip per-packet history logs (write-only for SR) and keep
+        # only the counters/stats the SimulationStats pipeline needs. The SR network
+        # sets this; default False preserves the tests' full histories.
+        self.low_memory = low_memory
+        # Always-on count of every forward-channel (re)transmission -- the low-memory
+        # equivalent of len(sent_new_rlnc_history), used by the SR stats override.
+        self.num_new_transmissions = 0
 
         # Feedback mode. In both E2E modes the source reads its feedback from the
         # dedicated per-chain end-to-end channels instead of the hop-0 path
@@ -112,6 +135,13 @@ class SRSender(GeneralSender):
         self.sent_fec_history: list[RLNCPacket] = []
         self.sent_fb_fec_history: list[RLNCPacket] = []
 
+        # Prune window for creation_time_to_seq in low-memory mode: keep >= 2 RTT of
+        # recent slot->seq records so a slot-based NACK (which arrives ~1 RTT after
+        # the send) can always still be resolved. Use the end-to-end RTT when the
+        # source hears feedback end-to-end, else the per-hop RTT.
+        base_rtt = self.e2e_rtt if (self.feedback_mode.is_e2e() and self.e2e_rtt) else self.hop_rtt
+        self._prune_window = 2 * base_rtt
+
     def run_step(self, time: int = None):
         # Updates t and collects current feedbacks into self.feedbacks (trimmed
         # to slots not after the latest packet on air).
@@ -138,7 +168,10 @@ class SRSender(GeneralSender):
             arrived = channel.pop_arrived_packets()
             if arrived:
                 self.feedbacks.extend(arrived)
-        self.all_feedback_history.extend(copy(self.feedbacks))
+        # Source-level feedback log is write-only for SR -> skip it in low-memory
+        # mode (it otherwise grows ~P entries per slot over the whole run).
+        if not self.low_memory:
+            self.all_feedback_history.extend(copy(self.feedbacks))
 
     def _process_feedbacks(self):
         # ACKs first: mark delivered and clear any pending retransmit.
@@ -211,7 +244,11 @@ class SRSender(GeneralSender):
         # Record first-transmission time per seq (inherited) and count the
         # transmission toward n (every send, including retransmits/drops).
         super().new_transmission_updates(packet)
-        self.sent_new_rlnc_history.append(packet)
+        # Always count; keep the packet objects only when not in low-memory mode
+        # (the list is write-only except for tests / direct introspection).
+        self.num_new_transmissions += 1
+        if not self.low_memory:
+            self.sent_new_rlnc_history.append(packet)
 
     def __repr__(self) -> str:
         s = "SRSender:"

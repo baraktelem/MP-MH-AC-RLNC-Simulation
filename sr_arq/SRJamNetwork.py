@@ -88,7 +88,7 @@ class SRJamMpMhNetwork(SRMpMhNetwork):
     def _make_path(self, prop_delay: int, epsilon: float, hop_index: int, path_index_in_hop: int) -> Path:
         # A JamPath is a Path whose ForwardChannel drops the packet whenever the
         # Jammer has flagged it jammed this slot.
-        return JamPath(prop_delay, epsilon, hop_index, path_index_in_hop, debug=self.debug)
+        return JamPath(prop_delay, epsilon, hop_index, path_index_in_hop, debug=self.debug, store_history=self.store_history)
 
     def _tick(self):
         # Jam first (sets/clears is_jammed on the selected links for this slot),
