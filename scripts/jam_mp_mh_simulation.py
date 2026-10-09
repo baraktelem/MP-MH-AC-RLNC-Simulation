@@ -1438,7 +1438,7 @@ def _run_main() -> None:
 
     # sweep_k config
     K_VALUES: list[int] = list(range(0, NUM_PATHS * NUM_HOPS + 1))
-    SWEEP_K_ALPHA = 2
+    SWEEP_K_ALPHA = 1
     K_RESULTS_FILE = f"jam_sweep_k_results_{_FB_TAG}.pkl"
     K_PLOT_FILE = f"jam_sweep_k_{_FB_TAG}.png"
 
@@ -1456,7 +1456,6 @@ def _run_main() -> None:
     # mp_mh_simulation.py (8x8 grid via np.arange(0.1, 0.9, 0.1)),
     # one 3D surface per k overlaid on each of the three metric subplots.
     EPS_GRID_VALUES: list[float] = [round(float(v), 2) for v in np.arange(0.1, 0.9, 0.1)]
-    # EPS_GRID_K_VALUES: list[int] = [0, 2, 4, 6, 8, 10, 12]
     tot_paths = NUM_HOPS * NUM_PATHS
     EPS_GRID_K_VALUES: list[int] = [0, int(0.25 * tot_paths), int(0.5 * tot_paths), int(0.75 * tot_paths)]
     EPS_GRID_RESULTS_FILE = f"jam_sweep_eps_grid_per_k_results_{_FB_TAG}.pkl"

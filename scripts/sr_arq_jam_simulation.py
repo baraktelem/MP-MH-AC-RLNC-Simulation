@@ -1041,7 +1041,7 @@ def _run_main() -> None:
 
     # sweep_k config
     K_VALUES: list[int] = list(range(0, NUM_PATHS * NUM_HOPS + 1))
-    SWEEP_K_ALPHA = 2
+    SWEEP_K_ALPHA = 1
     K_RESULTS_FILE = f"sr_jam_sweep_k_results_{_CFG_TAG}.pkl"
     K_PLOT_FILE = f"sr_jam_sweep_k_{_CFG_TAG}.png"
 
